@@ -186,3 +186,45 @@ def test_make_feature_source_memoises(monkeypatch, tmp_path):
     assert len(calls) == 2
     with pytest.raises(KeyError):
         src("nope.mkv")
+
+
+def _two_refs():
+    p, fs = _three()
+    p.references.append(Reference("r2", "OP", "OP 2", "E1.mkv", 90, 150))
+    return p, fs
+
+
+def test_failed_episode_one_flag_and_one_fetch_with_two_references():
+    p, fs = _two_refs()
+    calls = []
+
+    def src(f):
+        calls.append(f)
+        if f == "E2.mkv":
+            raise RuntimeError("boom")
+        return fs[f]
+
+    scan(p, src)
+    assert p.episodes["E2.mkv"].flags == ["Scan failed: boom"]
+    assert calls.count("E2.mkv") == 1
+
+
+def test_two_references_to_missing_episode_no_duplicate_flags():
+    p, fs = _three()
+    p.references[:] = [Reference("a", "OP", "OP 1", "gone.mkv", 0, 60),
+                       Reference("b", "ED", "ED 1", "gone.mkv", 100, 160)]
+    scan(p, fs.__getitem__)
+    for n in ("E1.mkv", "E2.mkv", "E3.mkv"):
+        assert len(p.episodes[n].flags) == len(set(p.episodes[n].flags)) == 1
+
+
+def test_failed_reference_leaves_other_reference_and_old_proposals_alone():
+    p, fs = _three()
+    p.references.append(Reference("bad", "ED", "ED 1", "gone.mkv", 0, 60))
+    p.episodes["E2.mkv"].cuts.append(Cut("old", 150, 190, "proposed", "bad", 0.9))
+    scan(p, fs.__getitem__)
+    ids = {c.id: c for c in p.episodes["E2.mkv"].cuts}
+    assert "old" in ids
+    (good,) = [c for c in ids.values() if c.reference_id == "r"]
+    assert good.start == pytest.approx(40, abs=0.5)
+    assert any(f.startswith("Scan failed") for f in p.episodes["E2.mkv"].flags)
