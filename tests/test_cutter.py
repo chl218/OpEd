@@ -63,7 +63,7 @@ def test_concat_list_escapes_quotes():
     assert "file 'it'\\''s.mkv'" in concat_list([(Path("it's.mkv"), 1.0, 2.0)])
 
 
-def test_no_stray_temp_files(tools, tmp_path):
+def test_no_stray_temp_files(tools, tmp_path, monkeypatch):
     src_dir = tmp_path / "src"
     out_dir = tmp_path / "out 日本 [1]"
     work = tmp_path / "work"
@@ -75,5 +75,14 @@ def test_no_stray_temp_files(tools, tmp_path):
     cut_audio(tools, info, [(0, 5.0), (15.0, 30)], out_dir / "a.mka", work)
     assert sorted(p.name for p in out_dir.iterdir()) == ["a.mka", "v.mkv"]
     assert list(work.iterdir()) == []
+
+    import oped.cutter as cutter
+
+    def broken_validate(*args, **kwargs):
+        raise SmartCutError("injected")
+
+    monkeypatch.setattr(cutter, "_validate", broken_validate)
     with pytest.raises(SmartCutError):
-        cut_video(tools, info, [(0, 5.0)], out_dir / "bad.mkv", "smart", work / "missing" / "x")
+        cut_video(tools, info, [(0, 5.0)], out_dir / "bad.mkv", "smart", work)
+    assert sorted(p.name for p in out_dir.iterdir()) == ["a.mka", "v.mkv"]
+    assert list(work.iterdir()) == []

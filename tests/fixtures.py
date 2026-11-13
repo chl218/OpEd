@@ -194,12 +194,18 @@ def make_color_video(
 
 
 def frame_color(tools: Tools, path: Path, t: float) -> tuple[int, int, int]:
+    """Mean RGB of the frame on screen at time t (the last frame with pts <= t).
+
+    A plain ``-ss t`` returns the first frame with pts >= t, i.e. the *next* frame
+    whenever t falls inside a frame's display interval.
+    """
+    t0 = max(0.0, t - 1.0)
     out = run([
-        tools.ffmpeg, "-v", "error", "-nostdin", "-ss", str(t), "-i", str(path),
-        "-frames:v", "1", "-vf", "scale=1:1:flags=area", "-pix_fmt", "rgb24",
-        "-f", "rawvideo", "-",
+        tools.ffmpeg, "-v", "error", "-nostdin", "-ss", f"{t0:.6f}", "-i", str(path),
+        "-t", f"{t - t0 + 0.0005:.6f}", "-vf", "scale=1:1:flags=area", "-pix_fmt", "rgb24",
+        "-fps_mode", "passthrough", "-f", "rawvideo", "-",
     ]).stdout
-    r, g, b = out[:3]
+    r, g, b = out[-3:]
     return int(r), int(g), int(b)
 
 
