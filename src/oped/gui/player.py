@@ -85,20 +85,37 @@ class Player(QWidget):
 
     # ---- public API ----
     def load(self, path: Path) -> None:
-        self._path = Path(path)
+        path = Path(path)
+        same = path == self._path and not self._source_failed and not self._in_preview
+        self._path = path
         self._reset_sequence()
         self._reset_preview_state()
-        self._loaded = False
+        if not same:
+            self._loaded = False  # Qt ignores setSource(same url) and emits no status
         self._source_failed = False
         self._last_pos = 0.0
         if not self._ensure_backend():
             return
         self._mp.stop()
         self._mp.setSource(QUrl.fromLocalFile(str(self._path)))
+        self._sync_loaded()
+
+    def _sync_loaded(self) -> None:
+        """Seed `_loaded` from the player's own status (signals are not always emitted)."""
+        if self._loaded or self._mp is None or not hasattr(self._mp, "mediaStatus"):
+            return
+        try:
+            from PySide6.QtMultimedia import QMediaPlayer
+
+            S = QMediaPlayer.MediaStatus
+            if self._mp.mediaStatus() in (S.LoadedMedia, S.BufferedMedia, S.BufferingMedia, S.StalledMedia):
+                self._loaded = True
+        except Exception:
+            pass
 
     def position(self) -> float:
-        if self._mp is None:
-            return self._last_pos
+        if self._mp is None or self._source_failed:
+            return self._last_pos  # the player may sit on a clip; _last_pos is source time
         p = self._mp.position() / 1000.0
         return p + self._preview_offset if self._in_preview else p
 
@@ -109,6 +126,8 @@ class Player(QWidget):
             return
         if self._in_preview:
             self._restore_source()
+        if self._source_failed:
+            return  # player is on a preview clip, not the source
         self._mp.setPosition(int(max(0.0, t) * 1000))
 
     def play_spans(self, spans: list[tuple[float, float]]) -> None:
@@ -118,6 +137,7 @@ class Player(QWidget):
             return
         if self._in_preview:
             self._restore_source()
+        self._sync_loaded()
         if self._source_failed or self._mp_errored():
             self._source_failed = True
             self._play_previews(spans)
@@ -212,6 +232,7 @@ class Player(QWidget):
             self.error_occurred.emit("Playback failed and ffmpeg is unavailable for preview clips.")
             return
         self._cleanup_tmp()
+        self._last_pos = spans[-1][1]  # where the playhead sits once previews finish
         self._tmp = Path(tempfile.mkdtemp(prefix="oped-preview-"))
         clips: list[tuple[float, Path]] = []
         try:

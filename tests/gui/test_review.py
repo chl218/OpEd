@@ -245,11 +245,15 @@ class FakeMP(QObject):
         super().__init__()
         self.positions, self.sources, self.played, self.paused = [], [], 0, 0
         self._err = QMediaPlayer.Error.NoError
+        self._status = S.NoMedia
 
     def setPosition(self, ms):
         self.positions.append(ms)
 
     def setSource(self, url):
+        if self.sources and self.sources[-1] == url.toLocalFile():
+            return  # like Qt: same source, no status emitted
+        self._status = S.NoMedia
         self.sources.append(url.toLocalFile())
 
     def play(self):
@@ -267,6 +271,13 @@ class FakeMP(QObject):
     def error(self):
         return self._err
 
+    def mediaStatus(self):
+        return self._status
+
+    def emit_status(self, status):
+        self._status = status
+        self.mediaStatusChanged.emit(status)
+
 
 def make_player(qtbot, loaded=True):
     pl = Player()
@@ -275,7 +286,7 @@ def make_player(qtbot, loaded=True):
     pl._attach(mp)
     pl.load(Path("ep.mkv"))
     if loaded:
-        mp.mediaStatusChanged.emit(S.LoadedMedia)
+        mp.emit_status(S.LoadedMedia)
     return pl, mp
 
 
@@ -464,3 +475,26 @@ def test_mark_reference_twice_updates_not_duplicates(qtbot, monkeypatch):
     assert (r.kind, r.label) == ("ED", "Renamed")
     c = p.episodes["E1.mkv"].cuts[0]
     assert c.reference_id == r.id and r.start == c.start
+
+
+def test_player_reload_same_file_does_not_hang(qtbot):
+    pl, mp = make_player(qtbot)
+    pl.load(Path("ep.mkv"))  # same source: Qt emits nothing
+    pl.play_spans([(10.0, 15.0)])
+    assert mp.positions == [10000] and not pl._pending
+
+
+def test_player_position_after_preview_is_source_time(qtbot, monkeypatch):
+    cmds = []
+    monkeypatch.setattr(player_mod, "run", fake_run(cmds))
+    pl, mp = make_player(qtbot)
+    pl.tools = Tools("ffmpeg", "ffprobe")
+    pl._source_failed = True
+    pl.play_spans([(5.0, 8.0), (225.0, 228.0)])
+    mp.mediaStatusChanged.emit(S.EndOfMedia)
+    mp.mediaStatusChanged.emit(S.EndOfMedia)
+    assert not pl._in_preview
+    assert pl.position() == 228.0
+    n = len(mp.positions)
+    pl.seek(100.0)
+    assert pl.position() == 100.0 and len(mp.positions) == n
