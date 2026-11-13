@@ -40,7 +40,7 @@ from ..export import EpisodeResult, existing_outputs, export_episode, export_sea
 from ..fingerprint import default_cache_dir
 from ..media import Tools, ToolsMissing, find_tools, probe, run
 from ..project import (EpisodeState, Project, Reference, confidence_level, load_project,
-                       project_path, save_project)
+                       local_path, project_path, save_project)
 from ..scan import make_feature_source, reference_candidates, scan
 from .cut_panel import CutPanel, format_time
 from .episode_list import EpisodeList
@@ -445,7 +445,20 @@ class MainWindow(QMainWindow):
             self._notices.append(f"No video files found in {path}.")
         try:
             self.project = load_project(self.season)
-        except (ValueError, TypeError, KeyError, AttributeError, OSError) as e:
+        except OSError as e:
+            # Locked, offline, permission denied: the file may be fine. Attach no project,
+            # so no autosave can replace it; the user reopens the folder to retry.
+            self.project = None
+            self.episode_list.clear()
+            self._notices.append(
+                f"Could not read the project file ({e}). The project is not loaded and "
+                "changes are not saved; fix the problem and open the folder again.")
+            self.setWindowTitle(f"OpEd - {path.name}")
+            self._update_actions()
+            self._update_banner()
+            self.project_changed.emit()
+            return
+        except (ValueError, TypeError, KeyError, AttributeError) as e:
             self.project = self._fresh_project()
             self._notices.append(
                 f"The saved project file was unreadable ({type(e).__name__}); "
@@ -471,7 +484,7 @@ class MainWindow(QMainWindow):
         """Copy the unreadable project file outside the season folder; report the real outcome."""
         assert self.season is not None
         try:
-            src = project_path(self.season.folder)
+            src = project_path(self.season.folder) or local_path(self.season.folder)
             digest = hashlib.sha1(str(Path(self.season.folder).resolve()).encode("utf-8")).hexdigest()
             dest_dir = Path(platformdirs.user_data_dir("oped")) / "backups"
             dest_dir.mkdir(parents=True, exist_ok=True)
@@ -488,10 +501,18 @@ class MainWindow(QMainWindow):
         if self.project is None:
             return
         try:
-            save_project(self.project)
+            saved = save_project(self.project)
         except OSError as e:
             self._notices = [n for n in self._notices if not n.startswith("Could not save")]
             self._notices.append(f"Could not save project: {e}")
+            self._update_banner()
+            return
+        before = list(self._notices)
+        self._notices = [n for n in self._notices
+                         if not n.startswith(("Could not save", "The season folder is not writable"))]
+        if saved != local_path(self.project.folder):
+            self._notices.append(f"The season folder is not writable; the project is saved to {saved}.")
+        if self._notices != before:
             self._update_banner()
 
     def closeEvent(self, event) -> None:

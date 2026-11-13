@@ -200,3 +200,38 @@ def test_hanging_tool_is_invalid_not_saved_and_refusal_shown(qtbot, monkeypatch,
     assert QSettings("oped", "oped").value("ffmpeg_path") is None
     assert w.tools == "PATH_TOOLS"
     assert "not accepted" in w.banner.text()
+
+
+def test_unreadable_project_file_is_not_treated_as_corrupt(qtbot, tmp_path, monkeypatch):
+    """S3: a locked/offline project file must not be replaced by a fresh project that
+    autosaves over it."""
+    data = tmp_path / "data"
+    monkeypatch.setattr(main_window.platformdirs, "user_data_dir", lambda *a, **k: str(data))
+    season = tmp_path / "season"
+    season.mkdir()
+    (season / "E1.mkv").write_bytes(b"")
+    good = '{"version": 1, "references": [], "episodes": {}}'
+    (season / "oped-project.json").write_text(good, encoding="utf-8")
+    monkeypatch.setattr(main_window, "load_project", raise_(PermissionError(13, "file is locked")))
+    w = MainWindow()
+    qtbot.addWidget(w)
+    w.open_folder(season)
+    assert w.project is None
+    assert "file is locked" in w.banner.text() and "not saved" in w.banner.text()
+    assert not w.action_scan.isEnabled() and not w.action_export.isEnabled()
+    w.mark_dirty()
+    w._autosave()
+    assert (season / "oped-project.json").read_text(encoding="utf-8") == good
+    assert not data.exists()  # no backup, no fallback save
+
+
+def test_banner_says_where_the_project_is_saved_when_folder_is_readonly(qtbot, tmp_path, monkeypatch):
+    elsewhere = tmp_path / "data" / "projects" / "abc.json"
+    monkeypatch.setattr(main_window, "save_project", lambda project: elsewhere)
+    (tmp_path / "E1.mkv").write_bytes(b"")
+    w = MainWindow()
+    qtbot.addWidget(w)
+    w.open_folder(tmp_path)
+    w._autosave()
+    w._autosave()
+    assert w.banner.text().count(str(elsewhere)) == 1

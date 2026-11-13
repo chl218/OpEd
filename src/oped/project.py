@@ -98,27 +98,38 @@ def confidence_level(c: float | None) -> Literal["manual", "high", "weak", "none
     return "none"
 
 
-def _writable(folder: Path) -> bool:
-    probe = Path(folder) / f".oped-write-test-{uuid.uuid4().hex[:8]}"
-    try:
-        probe.write_bytes(b"")
-        probe.unlink()
-        return True
-    except OSError:
-        return False
+def local_path(folder: Path) -> Path:
+    """``<season folder>/oped-project.json``."""
+    return Path(folder) / PROJECT_FILE
 
 
-def project_path(folder: Path) -> Path:
-    folder = Path(folder)
-    if _writable(folder):
-        return folder / PROJECT_FILE
-    digest = hashlib.sha1(str(folder.resolve()).encode("utf-8")).hexdigest()
+def fallback_path(folder: Path) -> Path:
+    """Where the project goes when the season folder is not writable."""
+    digest = hashlib.sha1(str(Path(folder).resolve()).encode("utf-8")).hexdigest()
     return Path(platformdirs.user_data_dir("oped")) / "projects" / f"{digest}.json"
 
 
+def project_path(folder: Path) -> Path | None:
+    """The saved project file ``load_project`` reads, or None if there is none.
+
+    ``oped-project.json`` in the season folder is read even when the folder is
+    read-only. If a data-dir copy exists too (saved while the folder was read-only),
+    the more recently written of the two wins.
+    """
+    found = [p for p in (local_path(folder), fallback_path(folder)) if p.exists()]
+    if not found:
+        return None
+    return max(found, key=lambda p: p.stat().st_mtime)  # max keeps the first on a tie
+
+
 def load_project(season: Season) -> Project:
+    """Read the saved project (see ``project_path``) or start an empty one.
+
+    Raises ``OSError`` if the file exists but cannot be read (locked, offline) and
+    ``ValueError``/``TypeError``/``KeyError``/``AttributeError`` if it is not a project.
+    """
     path = project_path(season.folder)
-    if path.exists():
+    if path is not None:
         project = Project.from_json(season.folder, json.loads(path.read_text(encoding="utf-8")))
     else:
         project = Project(Path(season.folder), [], {})
@@ -129,10 +140,34 @@ def load_project(season: Season) -> Project:
     return project
 
 
-def save_project(project: Project) -> Path:
-    path = project_path(project.folder)
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _write_atomic(path: Path, text: str) -> None:
+    """Write ``path`` via ``<path>.tmp`` + ``os.replace``; the temp never outlives a failure."""
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(project.to_json(), indent=2), encoding="utf-8")
-    os.replace(tmp, path)
-    return path
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def save_project(project: Project) -> Path:
+    """Save into the season folder; if that write fails, into the data dir. Returns the path.
+
+    No probe files: writability is decided by the real atomic write, so the only names
+    ever created in the season folder are ``oped-project.json`` and, for the duration
+    of a save, ``oped-project.json.tmp``.
+    """
+    text = json.dumps(project.to_json(), indent=2)
+    path = local_path(project.folder)
+    try:
+        _write_atomic(path, text)
+        return path
+    except OSError:
+        path = fallback_path(project.folder)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_atomic(path, text)
+        return path
