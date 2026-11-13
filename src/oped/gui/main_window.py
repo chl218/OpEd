@@ -28,6 +28,7 @@ from ..project import EpisodeState, Project, load_project, project_path, save_pr
 from .episode_list import EpisodeList
 
 AUTOSAVE_MS = 500
+TOOL_CHECK_TIMEOUT = 5.0
 
 
 def _tool_works(path: str) -> bool:
@@ -35,7 +36,7 @@ def _tool_works(path: str) -> bool:
     try:
         if not Path(path).is_file():
             return False
-        run([path, "-version"])
+        run([path, "-version"], timeout=TOOL_CHECK_TIMEOUT)
         return True
     except Exception:
         return False
@@ -52,6 +53,7 @@ class MainWindow(QMainWindow):
         self.season: Season | None = None
         self.project: Project | None = None
         self._tools_error = ""
+        self._tools_refusal = ""
         self._notices: list[str] = []
 
         self._save_timer = QTimer(self)
@@ -131,14 +133,14 @@ class MainWindow(QMainWindow):
     def set_tool_paths(self, ffmpeg: str, ffprobe: str) -> None:
         if not (_tool_works(ffmpeg) and _tool_works(ffprobe)):
             self._try_find_tools(None, None)
-            if self.tools is None:
-                self._tools_error = (
-                    f"The selected files did not run as ffmpeg/ffprobe (-version failed): "
-                    f"{ffmpeg}, {ffprobe}. " + self._tools_error
-                )
+            self._tools_refusal = (
+                "The selected files were not accepted (they must exist and run "
+                f"'-version' within {TOOL_CHECK_TIMEOUT:g} s): {ffmpeg}, {ffprobe}."
+            )
             self._update_actions()
             self._update_banner()
             return
+        self._tools_refusal = ""
         s = QSettings("oped", "oped")
         s.setValue("ffmpeg_path", ffmpeg)
         s.setValue("ffprobe_path", ffprobe)
@@ -161,11 +163,13 @@ class MainWindow(QMainWindow):
         lines: list[str] = []
         if self._tools_error:
             lines.append(self._tools_error)
+        if self._tools_refusal:
+            lines.append(self._tools_refusal)
         lines.extend(self._notices)
         if self.season is not None:
             lines.extend(self.season.warnings)
         self.banner.setText("\n".join(lines))
-        self.choose_ffmpeg_button.setVisible(bool(self._tools_error))
+        self.choose_ffmpeg_button.setVisible(bool(self._tools_error or self._tools_refusal))
         self.banner_frame.setVisible(bool(lines))
 
     def _update_actions(self) -> None:

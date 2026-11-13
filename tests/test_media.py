@@ -36,3 +36,14 @@ def test_fixture_helpers(tools, tmp_path):
     p = make_color_video(tools, tmp_path / "a.mkv", [("red", 3), ("blue", 3)])
     assert frame_color(tools, p, 1.0)[0] > 200
     assert dominant_freq(tools, p, 4.0) == pytest.approx(880, rel=0.03)
+
+
+def test_run_timeout_raises_ffmpeg_error():
+    import sys
+
+    import pytest
+
+    from oped.media import FfmpegError, run
+
+    with pytest.raises(FfmpegError, match="timed out"):
+        run([sys.executable, "-c", "import time; time.sleep(5)"], capture=False, timeout=0.3)

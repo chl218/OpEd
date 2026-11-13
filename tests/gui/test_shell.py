@@ -172,3 +172,31 @@ def test_invalid_tool_paths_not_saved_and_fall_back_to_path(qtbot, monkeypatch, 
     w2 = MainWindow()
     qtbot.addWidget(w2)
     assert seen == [(None, None)]
+
+
+def _slow_tool(tmp_path):
+    import sys
+
+    if sys.platform == "win32":
+        f = tmp_path / "slow.bat"
+        f.write_text("@echo off\r\nping -n 4 127.0.0.1 >nul\r\n")
+    else:
+        f = tmp_path / "slow.sh"
+        f.write_text("#!/bin/sh\nsleep 3\n")
+        f.chmod(0o755)
+    return f
+
+
+def test_hanging_tool_is_invalid_not_saved_and_refusal_shown(qtbot, monkeypatch, tmp_path):
+    from PySide6.QtCore import QSettings
+
+    monkeypatch.setattr(main_window, "TOOL_CHECK_TIMEOUT", 0.5)
+    monkeypatch.setattr(main_window, "find_tools", lambda ffmpeg=None, ffprobe=None: "PATH_TOOLS")
+    slow = _slow_tool(tmp_path)
+    assert main_window._tool_works(str(slow)) is False
+    w = MainWindow()
+    qtbot.addWidget(w)
+    w.set_tool_paths(str(slow), str(slow))
+    assert QSettings("oped", "oped").value("ffmpeg_path") is None
+    assert w.tools == "PATH_TOOLS"
+    assert "not accepted" in w.banner.text()

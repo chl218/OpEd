@@ -54,17 +54,23 @@ def find_tools(ffmpeg: str | None = None, ffprobe: str | None = None) -> Tools:
     return Tools(ffmpeg=str(ff), ffprobe=str(fp))
 
 
-def run(cmd: list[str], *, capture: bool = True) -> subprocess.CompletedProcess[bytes]:
+def run(
+    cmd: list[str], *, capture: bool = True, timeout: float | None = None
+) -> subprocess.CompletedProcess[bytes]:
     kwargs: dict = {}
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-    proc = subprocess.run(
-        [str(c) for c in cmd],
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.PIPE if capture else None,
-        stdin=subprocess.DEVNULL,
-        **kwargs,
-    )
+    try:
+        proc = subprocess.run(
+            [str(c) for c in cmd],
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+            **kwargs,
+        )
+    except subprocess.TimeoutExpired:
+        raise FfmpegError(cmd, f"timed out after {timeout} s") from None
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", "replace") if proc.stderr else ""
         raise FfmpegError(cmd, err)
