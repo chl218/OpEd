@@ -288,3 +288,21 @@ def test_cover_art_is_kept(tools, tmp_path, ext):
     assert abs(out.duration - 4) < 0.1
     if ext == "mkv":
         assert [s.tags.get("filename") for s in out.streams if s.kind == "attachment"] == [FONT.name]
+
+
+def test_recap_episode_sidecar_is_retimed_with_its_own_cuts(tools, tmp_path):
+    """`01.5.ass` must be written once, by episode 01.5, not overwritten by episode 01."""
+    season_dir = tmp_path / "Recap S1"
+    make_color_video(tools, season_dir / "[G] Show - 01.mkv", [("red", 6)])
+    make_color_video(tools, season_dir / "[G] Show - 01.5.mkv", [("red", 6)])
+    write_ass(season_dir / "[G] Show - 01.5.ass", [(4, 5, "recap")])
+    season = discover(season_dir)
+    p = load_project(season)
+    p.episodes["[G] Show - 01.mkv"].cuts.append(Cut("a", 0, 1, "approved"))     # 01: cut 1 s
+    p.episodes["[G] Show - 01.5.mkv"].cuts.append(Cut("b", 0, 3, "approved"))   # 01.5: cut 3 s
+    names = [ep.video.name for ep in season.episodes]          # the GUI exports in season order
+    assert names == ["[G] Show - 01.5.mkv", "[G] Show - 01.mkv"]
+    res = export_season(tools, p, season, names)
+    assert [r.status for r in res] == ["trimmed", "trimmed"], [r.message for r in res]
+    ev = pysubs2.load(str(output_folder(season_dir) / "[G] Show - 01.5.ass"))[0]
+    assert (ev.start, ev.end) == (1000, 2000)

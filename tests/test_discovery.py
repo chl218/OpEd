@@ -36,3 +36,48 @@ def test_subs_folder_layouts_fonts_and_mka_warning(tmp_path):
     assert sorted(p.name for p in s.episodes[0].sidecars) == ["2_English.srt", f"{name}.ass"]
     assert s.font_dirs == [tmp_path / "Fonts"]
     assert any("External audio" in w for w in s.warnings)
+
+
+def _by(season):
+    return {e.video.name: sorted(str(p.relative_to(season.folder)).replace("\\", "/") for p in e.sidecars)
+            for e in season.episodes}
+
+
+def test_sidecar_goes_only_to_the_longest_matching_stem(tmp_path):
+    """`01.5.ass` matches `01` by prefix and `01.5` exactly: only 01.5 may get it."""
+    for n in ("[G] Show - 01.mkv", "[G] Show - 01.5.mkv", "[G] Show - 01.ass",
+              "[G] Show - 01.5.ass", "[G] Show - 01.5.en.srt", "[G] Show - 01.en.srt"):
+        touch(tmp_path / n)
+    assert _by(discover(tmp_path)) == {
+        "[G] Show - 01.mkv": ["[G] Show - 01.ass", "[G] Show - 01.en.srt"],
+        "[G] Show - 01.5.mkv": ["[G] Show - 01.5.ass", "[G] Show - 01.5.en.srt"],
+    }
+
+
+def test_longest_stem_wins_under_subs_folder(tmp_path):
+    for n in ("[G] Show - 01.mkv", "[G] Show - 01.5.mkv", "E1.mkv", "E10.mkv"):
+        touch(tmp_path / n)
+    for n in ("[G] Show - 01.ass", "[G] Show - 01.5.ass", "[G] Show - 01.5.en.ass",
+              "E1.ass", "E10.ass", "E10.en.ass"):
+        touch(tmp_path / "Subs" / n)
+    touch(tmp_path / "Subs" / "[G] Show - 01" / "track.srt")
+    touch(tmp_path / "Subs" / "[G] Show - 01.5" / "track.srt")
+    assert _by(discover(tmp_path)) == {
+        "E1.mkv": ["Subs/E1.ass"],
+        "E10.mkv": ["Subs/E10.ass", "Subs/E10.en.ass"],
+        "[G] Show - 01.mkv": ["Subs/[G] Show - 01.ass", "Subs/[G] Show - 01/track.srt"],
+        "[G] Show - 01.5.mkv": ["Subs/[G] Show - 01.5.ass", "Subs/[G] Show - 01.5.en.ass",
+                                "Subs/[G] Show - 01.5/track.srt"],
+    }
+
+
+def test_non_ascii_and_apostrophe_names(tmp_path):
+    a = "[Grp] Frieren's Journey 葬送のフリーレン - 01"
+    b = a + ".5"
+    for n in (f"{a}.mkv", f"{b}.mkv", f"{a}.ja.ass", f"{b}.ja.ass"):
+        touch(tmp_path / n)
+    touch(tmp_path / "Subs" / a / "日本語.ass")
+    assert _by(discover(tmp_path)) == {
+        f"{a}.mkv": [f"Subs/{a}/日本語.ass", f"{a}.ja.ass"],
+        f"{b}.mkv": [f"{b}.ja.ass"],
+    }
