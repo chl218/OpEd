@@ -117,6 +117,26 @@ def _write_vobsub(base: Path, lines: list[tuple[float, float, str]]) -> Path:
     return idx_path
 
 
+def _vobsub_mkv(idx: Path, lines: list[tuple[float, float, str]], out: Path,
+                durations: bool = True) -> Path:
+    """Remux a .idx/.sub into mkv with real block durations, as mkvmerge does.
+
+    ffmpeg's VobSub demuxer reports duration 0, which would make every cue an
+    unterminated display-set packet; real MKV files carry BlockDuration.
+    """
+    import av
+    with av.open(str(idx)) as inp, av.open(str(out), "w") as outc:
+        ist = inp.streams.subtitles[0]
+        ost = outc.add_stream_from_template(ist)
+        for pkt, (s, e, _) in zip(inp.demux(ist), lines):
+            if pkt.pts is None:
+                continue
+            pkt.stream = ost
+            pkt.duration = round(max(e - s, 0.1) / pkt.time_base) if durations else 0
+            outc.mux(pkt)
+    return out
+
+
 def make_color_video(
     tools: Tools,
     path: Path,
@@ -164,7 +184,9 @@ def make_color_video(
             extra += 1
             sub_codecs.append("mov_text" if ext in (".mp4", ".m4v", ".mov") else "ass")
         if image_sub:
-            idx = _write_vobsub(tmp / "img", ass_lines or [(0.5, 1.5, "x")])
+            img_lines = ass_lines or [(0.5, 1.5, "x")]
+            idx = _write_vobsub(tmp / "img", img_lines)
+            idx = _vobsub_mkv(idx, img_lines, tmp / "img.mkv")
             cmd += ["-i", str(idx)]
             maps += ["-map", f"{n_in + extra}:0"]
             extra += 1
@@ -221,3 +243,20 @@ def dominant_freq(tools: Tools, path: Path, t: float, stream: int = 0) -> float:
     x = x * np.hanning(len(x))
     spec = np.abs(np.fft.rfft(x))
     return float(np.argmax(spec) * RATE / len(x))
+
+
+def write_ass(path: Path, lines: list[tuple[float, float, str]]) -> Path:
+    _write_ass(path, lines)
+    return path
+
+
+def extract_sub_events(tools: Tools, path: Path, stream: int = 0) -> list[tuple[float, float]]:
+    """(start, end) seconds of every packet of subtitle stream s:<stream>, in file order."""
+    import json
+    out = run([tools.ffprobe, "-v", "error", "-select_streams", f"s:{stream}", "-show_packets",
+               "-of", "json", str(path)]).stdout
+    ev = []
+    for p in json.loads(out).get("packets", []):
+        start = float(p["pts_time"])
+        ev.append((start, start + float(p.get("duration_time", 0) or 0)))
+    return ev
