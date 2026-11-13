@@ -252,3 +252,39 @@ def test_mp4_stays_mp4_with_faststart(tools, tmp_path):
     assert data.find(b"moov") < data.find(b"mdat")                          # +faststart
     assert calls and calls[-1] == 1.0 and calls == sorted(calls)
     assert isinstance(r, EpisodeResult)
+
+
+@pytest.mark.parametrize("ext", ["mkv", "mp4"])
+def test_cover_art_is_kept(tools, tmp_path, ext):
+    """matroskadec/mov expose cover art as an attached_pic video stream, not an attachment."""
+    png = tmp_path / "cover.png"
+    run([tools.ffmpeg, "-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "color=c=yellow:s=64x64:d=1",
+         "-frames:v", "1", str(png)])
+    plain = make_color_video(tools, tmp_path / f"plain.{ext}", [("red", 3), ("green", 3)], font=FONT if ext == "mkv" else None)
+    season_dir = tmp_path / "Cover S1"
+    season_dir.mkdir()
+    src = season_dir / f"E1.{ext}"
+    if ext == "mkv":
+        run([tools.ffmpeg, "-v", "error", "-nostdin", "-y", "-i", str(plain), "-map", "0", "-c", "copy",
+             "-attach", str(png), "-metadata:s:t:1", "mimetype=image/png",
+             "-metadata:s:t:1", "filename=cover.png", str(src)])
+    else:
+        run([tools.ffmpeg, "-v", "error", "-nostdin", "-y", "-i", str(plain), "-i", str(png),
+             "-map", "0", "-map", "1", "-c", "copy", "-disposition:v:1", "attached_pic", str(src)])
+    pics = lambda info: [(s.codec, s.tags.get("filename")) for s in info.streams
+                         if s.kind == "video" and s.disposition.get("attached_pic")]
+    assert len(pics(probe(tools, src))) == 1
+    season = discover(season_dir)
+    out_dir = output_folder(season_dir)
+    r = export_episode(tools, season.episodes[0], season_dir, [(2, 4)], out_dir)
+    assert r.status == "trimmed", r.message
+    out = probe(tools, out_dir / f"E1.{ext}")
+    assert pics(out) == pics(probe(tools, src))
+    idx = next(s.index for s in out.streams if s.kind == "video" and s.disposition.get("attached_pic"))
+    raw = run([tools.ffmpeg, "-v", "error", "-nostdin", "-i", str(out_dir / f"E1.{ext}"), "-map", f"0:{idx}",
+               "-c", "copy", "-frames:v", "1", "-f", "data", "-"]).stdout
+    assert raw == png.read_bytes()
+    assert out.video().codec == "h264" and not out.video().disposition.get("attached_pic")
+    assert abs(out.duration - 4) < 0.1
+    if ext == "mkv":
+        assert [s.tags.get("filename") for s in out.streams if s.kind == "attachment"] == [FONT.name]

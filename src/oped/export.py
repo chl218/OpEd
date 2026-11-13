@@ -6,6 +6,7 @@ only once complete, so a half-written file never carries the final name.
 """
 from __future__ import annotations
 
+import mimetypes
 import os
 import shutil
 import tempfile
@@ -29,9 +30,11 @@ Status = Literal["trimmed", "copied", "failed", "needs_fallback"]
 _FORMATS = {".mkv": "matroska", ".mka": "matroska", ".webm": "webm",
             ".mp4": "mp4", ".m4v": "mp4", ".mov": "mov"}
 _FASTSTART = {"mp4", "mov"}
+_PIC_MIME = {"png": "image/png", "mjpeg": "image/jpeg", "bmp": "image/bmp", "webp": "image/webp",
+             "gif": "image/gif"}
 _STREAM_TAGS = ("language", "title")
 _DISPOSITIONS = ("default", "dub", "original", "comment", "lyrics", "karaoke", "forced",
-                 "hearing_impaired", "visual_impaired", "captions", "descriptions")
+                 "hearing_impaired", "visual_impaired", "captions", "descriptions", "attached_pic")
 
 
 @dataclass
@@ -178,7 +181,7 @@ def export_episode(tools: Tools, ep: EpisodeFiles, season_folder: Path, cuts: li
         meta = write_ffmetadata(info.chapters, tm, work / "chapters.ffmeta") if info.chapters else None
         report(0.85)
 
-        _mux(tools, info, video, audio, subs, meta, part, final.suffix.lower())
+        _mux(tools, info, video, audio, subs, meta, part, final.suffix.lower(), work)
         for tmp, dst in sides:
             dst.parent.mkdir(parents=True, exist_ok=True)
             os.replace(tmp, dst)
@@ -197,7 +200,18 @@ def export_episode(tools: Tools, ep: EpisodeFiles, season_folder: Path, cuts: li
 
 
 def _mux(tools: Tools, info: MediaInfo, video: Path, audio: Path | None, subs: Path | None,
-         meta: Path | None, part: Path, ext: str) -> None:
+         meta: Path | None, part: Path, ext: str, work: Path) -> None:
+    fmt = _FORMATS.get(ext, "matroska")
+    v = info.video()
+    # Cover art: matroskadec exposes image attachments, and MP4 its covr atom, as
+    # single-picture video streams with attached_pic, not as type ``t``. The matroska
+    # muxer would write such a stream back as a png/mjpeg video *track*, so for MKV the
+    # picture is extracted and re-attached; other containers map the stream as is.
+    pics = [s for s in info.streams if s.kind == "video" and s.disposition.get("attached_pic") and s is not v]
+    reattach = [(pic, _extract_picture(tools, info.path, pic, work / f"cover_{n}.bin"))
+                for n, pic in enumerate(pics)] if fmt == "matroska" else []
+    if reattach:
+        pics = []
     cmd: list[str] = [tools.ffmpeg, "-v", "error", "-nostdin", "-y"]
     inputs = [video] + ([audio] if audio else []) + ([subs] if subs else []) + [info.path]
     for p in inputs:
@@ -217,22 +231,36 @@ def _mux(tools: Tools, info: MediaInfo, video: Path, audio: Path | None, subs: P
     elif info.subtitles():
         # Every cue was cut: keep the (now empty) streams, codec headers and all.
         cmd += ["-map", f"{src}:s", "-bsf:s", "noise=drop=1"]
+    for pic in pics:
+        cmd += ["-map", f"{src}:{pic.index}"]
     cmd += ["-map", f"{src}:t?", "-map_chapters", str(meta_idx), "-map_metadata", str(src), "-c", "copy"]
 
-    # Output stream order: first video, all audio, all subtitles (source order), then
-    # attachments, which keep their own filename/mimetype tags.
-    v = info.video()
-    ordered = ([v] if v else []) + (info.audio() if audio else []) + info.subtitles()
+    # Output stream order: first video, all audio, all subtitles (source order), cover
+    # art, source attachments (they keep their own filename/mimetype tags), then the
+    # re-attached MKV cover pictures, which ``-attach`` appends last.
+    ordered = ([v] if v else []) + (info.audio() if audio else []) + info.subtitles() + pics
     for n, s in enumerate(ordered):
         cmd += _stream_args(n, s)
+    n = len(ordered) + sum(1 for s in info.streams if s.kind == "attachment")
+    for i, (pic, path) in enumerate(reattach):
+        mime = pic.tags.get("mimetype") or _PIC_MIME.get(pic.codec, "image/jpeg")
+        fname = pic.tags.get("filename") or f"cover_{i}{mimetypes.guess_extension(mime) or '.jpg'}"
+        cmd += ["-attach", str(path), f"-metadata:s:{n + i}", f"mimetype={mime}",
+                f"-metadata:s:{n + i}", f"filename={fname}"]
 
-    fmt = _FORMATS.get(ext, "matroska")
     if fmt == "matroska":
         cmd += ["-default_mode", "passthrough"]
     if fmt in _FASTSTART:
         cmd += ["-movflags", "+faststart"]
     cmd += ["-f", fmt, str(part)]
     run(cmd)
+
+
+def _extract_picture(tools: Tools, src: Path, pic: StreamInfo, out: Path) -> Path:
+    """Raw bytes of a single-picture (attached_pic) stream."""
+    run([tools.ffmpeg, "-v", "error", "-nostdin", "-y", "-i", str(src), "-map", f"0:{pic.index}",
+         "-c", "copy", "-frames:v", "1", "-f", "data", str(out)])
+    return out
 
 
 # ---------------------------------------------------------------- season
