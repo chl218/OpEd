@@ -298,3 +298,19 @@ def tone_switch(tools: Tools, path: Path, lo: float, hi: float, f_old: float, f_
         if abs(seg @ np.exp(-2j * np.pi * f_new * tt)) > abs(seg @ np.exp(-2j * np.pi * f_old * tt)):
             return lo + (i + n / 2) / RATE
     raise AssertionError("no tone switch found")
+
+
+def melody(seed: int, secs: float, sr: int = 12000) -> np.ndarray:
+    """Deterministic tonal test signal: random 0.25 s notes with a few harmonics."""
+    rng = np.random.default_rng(seed)
+    note = int(sr * 0.25)
+    n_notes = int(np.ceil(secs * sr / note))
+    out = np.zeros(n_notes * note, np.float32)
+    t = np.arange(note) / sr
+    env = np.minimum(1.0, np.minimum(t, t[::-1]) / 0.01)
+    for i in range(n_notes):
+        semis = int(rng.integers(0, 24))
+        f0 = 220.0 * 2 ** (semis / 12)
+        tone = sum(np.sin(2 * np.pi * f0 * h * t) / h for h in (1, 2, 3))
+        out[i * note:(i + 1) * note] = (0.3 * env * tone).astype(np.float32)
+    return out[: int(secs * sr)]
