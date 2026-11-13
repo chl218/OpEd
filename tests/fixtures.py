@@ -314,3 +314,33 @@ def melody(seed: int, secs: float, sr: int = 12000) -> np.ndarray:
         tone = sum(np.sin(2 * np.pi * f0 * h * t) / h for h in (1, 2, 3))
         out[i * note:(i + 1) * note] = (0.3 * env * tone).astype(np.float32)
     return out[: int(secs * sr)]
+
+
+_SR = 12000  # fingerprint.SAMPLE_RATE
+OP_SECS = 60
+OP_PCM = melody(7, OP_SECS)
+
+
+def episode(op_at, op_len=60, total=1300, seed=0, op_seed=7, op_trim=0, overlay=0.0):
+    """Noise-ish 'dialogue' (melody with seed) with the OP inserted at op_at seconds.
+
+    ``op_at`` None means no OP; a negative value means the episode starts |op_at| s
+    into the OP. ``op_trim`` drops seconds from the OP's end, and ``overlay`` mixes an
+    unrelated sound over the OP at that gain. The background uses a melody seed that
+    never coincides with the OP's, plus a little white noise, deterministically per seed.
+    """
+    rng = np.random.default_rng(seed)
+    pcm = melody(1000 + seed, total) * 0.8
+    pcm += (0.02 * rng.standard_normal(len(pcm))).astype(np.float32)
+    if op_at is None:
+        return pcm
+    op = OP_PCM if (op_seed, op_len) == (7, OP_SECS) else melody(op_seed, op_len)
+    op = op[: len(op) - round(op_trim * _SR)]
+    pos = round(op_at * _SR)
+    if pos < 0:
+        op, pos = op[-pos:], 0
+    op = op[: len(pcm) - pos].copy()
+    if overlay:
+        op += overlay * melody(5000 + seed, len(op) / _SR + 1)[: len(op)]
+    pcm[pos:pos + len(op)] = op
+    return pcm
