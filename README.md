@@ -63,7 +63,7 @@ Confidence thresholds (`src/oped/project.py`): 0.85 and above is high, 0.65 up t
 
 - Smart cut is the default. Only the part of each cut point up to the next keyframe is re-encoded, and everything else is stream-copied. Video and audio are cut separately and muxed with the source's other tracks.
 - If smart cut fails for a file, OpEd asks you to choose: exact re-encode (slow), fast keyframe cut (may keep about 2 s of the cut region), or skip. It never falls back silently. Sources with open-GOP x264 currently fail smart cut and take this path.
-- Subtitles: text subtitles are clipped at cut edges and retimed. Image subtitles (PGS, VobSub) are kept or dropped whole. External sidecar subtitles next to the video (same stem, for example `Show - 01.en.ass`) are matched and handled the same way.
+- Subtitles: text subtitles are clipped at cut edges and retimed. Image subtitles (PGS, VobSub) are kept or dropped whole. External sidecar subtitles next to the video (same stem, for example `Show - 01.en.ass`) (and `.srt`, `.ass`, `.ssa`, `.vtt`, `.sup`) are matched and handled the same way. Sidecars are also taken from a `Subs/` (or `subs/`) folder, either directly by matching stem or from `Subs/<episode stem>/`.
 - Chapters: retimed to the output; chapters that start inside a cut are dropped.
 - Attachments (fonts) and cover art are carried over, and stream metadata and dispositions are preserved.
 - Files are written as `.part` and renamed when complete, so a half-written file never has its final name.
@@ -72,12 +72,12 @@ Confidence thresholds (`src/oped/project.py`): 0.85 and above is high, 0.65 up t
 
 | What | Where |
 | --- | --- |
-| Project (references, cuts, decisions) | `<season folder>/oped-project.json`; if that folder is not writable, `<user data dir>/oped/projects/<sha1 of folder path>.json` |
-| Backup of an unreadable project file | `<user data dir>/oped/backups/<sha1>-<timestamp>.json` (a fresh project is started) |
-| Audio fingerprint cache | `<user cache dir>/oped/fingerprints/` |
+| Project (references, cuts, decisions) | `<season folder>/oped-project.json`; if that folder is not writable, `<user data dir>/projects/<sha1 of folder path>.json` |
+| Backup of an unreadable project file | `<user data dir>/backups/<sha1>-<timestamp>.json` (a fresh project is started) |
+| Audio fingerprint cache | `<user cache dir>/fingerprints/` |
 | Trimmed episodes | `<season folder> (trimmed)/` next to the season folder |
 
-User data and cache dirs come from `platformdirs` (on Windows `%LOCALAPPDATA%\oped\...`, on macOS `~/Library/Application Support/oped` and `~/Library/Caches/oped`, on Linux `~/.local/share/oped` and `~/.cache/oped`).
+`<user data dir>` and `<user cache dir>` are `platformdirs.user_data_dir("oped")` and `platformdirs.user_cache_dir("oped")`. On Windows (checked) these are `%LOCALAPPDATA%\oped\oped` and `%LOCALAPPDATA%\oped\oped\Cache`. On macOS (`~/Library/Application Support/oped`, `~/Library/Caches/oped`) and Linux (`~/.local/share/oped`, `~/.cache/oped`) they come from platformdirs defaults and are untested.
 
 ## Tests
 
