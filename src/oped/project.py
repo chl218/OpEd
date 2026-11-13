@@ -41,6 +41,9 @@ class Cut:
     status: Status = "proposed"
     reference_id: str | None = None
     confidence: float | None = None
+    # True once the user changed the cut's times. A re-scan keeps an edited proposal
+    # (it is a user decision, like approved/rejected) instead of replacing it.
+    edited: bool = False
 
 
 @dataclass

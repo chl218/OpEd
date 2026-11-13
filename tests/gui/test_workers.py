@@ -419,3 +419,66 @@ def test_current_episode_reprobed_after_tools_found(qtbot, tmp_path, monkeypatch
     w.set_tool_paths("a/ffmpeg", "a/ffprobe")
     assert "Cannot review" not in w.banner.text()
     assert w.cut_panel.file == "E1.mkv"
+
+
+# ---------------------------------------------------------------- rescan keeps user decisions
+
+def test_rescan_keeps_decisions_edits_and_a_deleted_reference_stays_deleted(qtbot, window_with_project, monkeypatch):
+    """Through the real worker deep-copy/copy-back: approved, rejected, hand-added and
+    edited cuts survive a re-scan, an edited reference cut moves the reference, and a
+    deleted reference is not resurrected (nor approved by Approve all high)."""
+    from oped.gui import cut_panel as cut_panel_mod
+
+    w, p = window_with_project
+    fake_source(monkeypatch, lambda name: ed_feats(*REPEATING[name]))
+    monkeypatch.setattr(main_window, "probe", lambda tools, path: MediaInfo(
+        path=path, duration=400.0, container="mkv", streams=(), chapters=(), fps=24.0))
+    monkeypatch.setattr(cut_panel_mod, "confirm_delete_reference", lambda *a: True)
+    p.references += [Reference("op", "OP", "OP 1", "E1.mkv", 30, 90),
+                     Reference("ed", "ED", "ED 1", "E1.mkv", 320, 390)]
+    w.start_scan()
+    qtbot.waitUntil(lambda: idle(w), timeout=20000)
+    for st in p.episodes.values():
+        assert [c.reference_id for c in st.cuts] == ["op", "ed"]
+
+    cp, rows = w.cut_panel, {n: i for i, n in enumerate(p.episodes)}
+
+    def open_episode(name):
+        w.episode_list.setCurrentRow(rows[name])
+        assert cp.file == name
+
+    open_episode("E2.mkv")
+    cp.select(0); cp.approve()            # E2 OP approved
+    cp.select(1); cp.reject()             # E2 ED rejected
+    open_episode("E3.mkv")
+    cp.select(0)
+    cp.toggle_edge(); cp.nudge(-1.0)      # E3 OP: edited proposal (end - 1 s)
+    open_episode("E1.mkv")
+    cp.select(0)
+    cp.nudge(1.0)                         # edit the OP reference's own cut
+    w.player.seek(200.0)
+    cp.add_cut()                          # hand-added cut at 200..260
+    cp.select([c.reference_id for c in cp._cuts()].index("ed"))
+    cp.delete(cp.selected)                # delete the ED reference (E3's ED proposal goes)
+    assert [c.reference_id for c in p.episodes["E3.mkv"].cuts] == ["op"]
+    before = {n: [(c.id, c.start, c.end, c.status, c.reference_id) for c in st.cuts]
+              for n, st in p.episodes.items()}
+
+    w.start_scan()                        # confirmed reference exists: straight to the worker
+    assert not w.action_scan.isEnabled()
+    qtbot.waitUntil(lambda: idle(w), timeout=20000)
+
+    after = {n: [(c.id, c.start, c.end, c.status, c.reference_id) for c in st.cuts]
+             for n, st in p.episodes.items()}
+    assert after == before
+    assert [r.id for r in p.references] == ["op"]
+    assert (p.references[0].start, p.references[0].end) == (31, 90)
+    assert [c[4] for c in after["E2.mkv"]] == ["op", None]           # rejected ED kept, unlinked
+    assert len(after["E1.mkv"]) == 2 and after["E1.mkv"][1][1:3] == (200.0, 260.0)
+    for cuts in after.values():
+        assert [c[1] for c in cuts] == sorted(c[1] for c in cuts)
+    assert not any("ED 1" in f for st in p.episodes.values() for f in st.flags)
+
+    w.approve_all_high()
+    assert all(not (319 < c.start < 321) for st in p.episodes.values() for c in st.cuts
+               if c.status == "approved")

@@ -240,3 +240,23 @@ def test_failed_reference_leaves_other_reference_and_old_proposals_alone():
     (good,) = [c for c in ids.values() if c.reference_id == "r"]
     assert good.start == pytest.approx(40, abs=0.5)
     assert any(f.startswith("Scan failed") for f in p.episodes["E2.mkv"].flags)
+
+
+def test_edited_proposal_survives_rescan_without_duplicate():
+    """M2: an edge edit on a proposal is a user decision; a re-scan keeps it as is."""
+    p, fs = _three()
+    scan(p, fs.__getitem__)
+    (c,) = p.episodes["E2.mkv"].cuts
+    c.start, c.edited = c.start + 1.0, True
+    edited = (c.id, c.start, c.end)
+    scan(p, fs.__getitem__)
+    assert [(k.id, k.start, k.end) for k in p.episodes["E2.mkv"].cuts] == [edited]
+    assert p.episodes["E2.mkv"].cuts[0].status == "proposed"
+
+
+def test_rescan_sorts_cuts_by_start():
+    p, fs = _three()
+    p.episodes["E2.mkv"].cuts.append(Cut("hand", 150, 160, "proposed"))
+    scan(p, fs.__getitem__)
+    starts = [c.start for c in p.episodes["E2.mkv"].cuts]
+    assert len(starts) == 2 and starts == sorted(starts)

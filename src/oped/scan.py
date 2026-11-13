@@ -1,9 +1,10 @@
 """Project scan: locate confirmed OP/ED references in every episode and propose cuts.
 
-User decisions are sacred. A re-scan replaces only an episode's *proposed* cuts that came
-from a reference; approved, rejected and hand-added (``reference_id is None``) cuts are
-kept, and a new proposal that overlaps (> 50 % of the shorter interval) an approved or
-rejected cut of the same reference is skipped.
+User decisions are sacred. A re-scan replaces only an episode's *proposed*, unedited cuts
+that came from a reference; approved, rejected, edited (``Cut.edited``) and hand-added
+(``reference_id is None``) cuts are kept, and a new proposal that overlaps (> 50 % of the
+shorter interval) an approved, rejected or edited cut of the same reference is skipped.
+An episode's cuts are left sorted by start.
 
 Failure handling: if features cannot be built for an episode, or the reference itself is
 unusable (its episode is missing from the project, or its span is empty or beyond the
@@ -112,13 +113,14 @@ def scan(project: Project, feats: FeatureSource,
             evaluated.add(ref.id)
 
         kept = [c for c in state.cuts
-                if not (c.status == "proposed" and c.reference_id in evaluated)]
+                if not (c.status == "proposed" and not c.edited and c.reference_id in evaluated)]
         for c in proposals:
-            decided = (k for k in kept
-                       if k.reference_id == c.reference_id and k.status in ("approved", "rejected"))
+            decided = (k for k in kept if k.reference_id == c.reference_id
+                       and (k.status in ("approved", "rejected") or k.edited))
             if any(_overlap_fraction(c.start, c.end, k.start, k.end) > 0.5 for k in decided):
                 continue
             kept.append(c)
+        kept.sort(key=lambda c: (c.start, c.end))
         state.cuts = kept
         state.flags = flags
         state.scanned = True

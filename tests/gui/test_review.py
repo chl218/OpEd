@@ -498,3 +498,82 @@ def test_player_position_after_preview_is_source_time(qtbot, monkeypatch):
     n = len(mp.positions)
     pl.seek(100.0)
     assert pl.position() == 100.0 and len(mp.positions) == n
+
+
+# ---------------------------------------------------------------- edits and references (M2/M3)
+
+def _with_reference(qtbot, pos=0.0):
+    from oped.project import Reference
+
+    p = project_with(["E1.mkv", "E2.mkv", "E3.mkv"])
+    p.references.append(Reference("r", "OP", "OP 1", "E1.mkv", 30.0, 90.0))
+    p.episodes["E1.mkv"].cuts = [Cut("own", 30.0, 90.0, "proposed", "r", None),
+                                 Cut("hand", 200.0, 210.0, "approved")]
+    p.episodes["E2.mkv"].cuts = [Cut("p2", 50.0, 110.0, "proposed", "r", 0.95),
+                                 Cut("a2", 300.0, 310.0, "approved", "r", 0.9)]
+    p.episodes["E3.mkv"].cuts = [Cut("x3", 40.0, 100.0, "rejected", "r", 0.9)]
+    p.episodes["E3.mkv"].flags = ["OP 1 match weak", "other"]
+    panel = CutPanel(player=FakePlayer(position=pos))
+    qtbot.addWidget(panel)
+    panel.set_episode(p, "E1.mkv", 400, 24.0)
+    return p, panel
+
+
+@pytest.mark.parametrize("how", ["nudge", "set_in", "edit_time"])
+def test_editing_a_proposal_marks_it_edited_and_keeps_its_reference(qtbot, how):
+    p, panel = _with_reference(qtbot, pos=52.0)
+    panel.set_episode(p, "E2.mkv", 400, 24.0)
+    panel.select(0)
+    {"nudge": lambda: panel.nudge(1.0), "set_in": panel.set_in,
+     "edit_time": lambda: panel.edit_time(0, "start", "0:52")}[how]()
+    c = p.episodes["E2.mkv"].cuts[0]
+    assert c.edited and c.start != 50.0
+    assert (c.reference_id, c.status) == ("r", "proposed")
+    assert (p.references[0].start, p.references[0].end) == (30.0, 90.0)  # not its own cut
+
+
+def test_editing_the_reference_own_cut_updates_the_reference(qtbot):
+    p, panel = _with_reference(qtbot)
+    panel.select(0)
+    panel.nudge(-1.0)
+    panel.toggle_edge()
+    panel.nudge(0.5)
+    ref, c = p.references[0], p.episodes["E1.mkv"].cuts[0]
+    assert (ref.start, ref.end) == (c.start, c.end) == (29.0, 90.5)
+    assert c.reference_id == "r"
+
+
+def test_deleting_the_reference_own_cut_asks_and_removes_the_reference(qtbot, monkeypatch):
+    p, panel = _with_reference(qtbot)
+    asked = []
+    monkeypatch.setattr(cut_panel, "confirm_delete_reference",
+                        lambda parent, label, proposed, decided: asked.append((label, proposed, decided)) or True)
+    with qtbot.waitSignal(panel.changed, timeout=1000):
+        panel.delete(0)
+    assert asked == [("OP 1", 1, 2)]          # E2 proposal dropped; E2 approved + E3 rejected kept
+    assert p.references == []
+    assert [c.id for c in p.episodes["E1.mkv"].cuts] == ["hand"]
+    assert [(c.id, c.reference_id) for c in p.episodes["E2.mkv"].cuts] == [("a2", None)]
+    assert [(c.id, c.status, c.reference_id) for c in p.episodes["E3.mkv"].cuts] == [("x3", "rejected", None)]
+    assert p.episodes["E3.mkv"].flags == ["other"]
+
+
+def test_cancelled_reference_delete_changes_nothing(qtbot, monkeypatch):
+    import copy
+
+    p, panel = _with_reference(qtbot)
+    before = copy.deepcopy(p)
+    monkeypatch.setattr(cut_panel, "confirm_delete_reference", lambda *a: False)
+    panel.delete(0)
+    assert p == before
+
+
+def test_deleting_other_cuts_does_not_ask(qtbot, monkeypatch):
+    from conftest import raise_
+
+    p, panel = _with_reference(qtbot)
+    monkeypatch.setattr(cut_panel, "confirm_delete_reference", raise_(AssertionError("asked")))
+    panel.delete(1)                                    # hand-added cut in the reference episode
+    panel.set_episode(p, "E2.mkv", 400, 24.0)
+    panel.delete(0)                                    # a matched proposal elsewhere
+    assert len(p.references) == 1

@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -86,6 +87,20 @@ def ask_kind(parent, default: tuple[str, str]) -> tuple[str, str] | None:
     if dlg.exec() != QDialog.Accepted:
         return None
     return kind.currentText(), label.text().strip() or default[1]
+
+
+def confirm_delete_reference(parent, label: str, proposed: int, decided: int) -> bool:
+    """Ask before deleting a reference together with its own cut. Module-level so tests
+    can monkeypatch it."""
+    lines = [f'This cut is the reference "{label}". Deleting it deletes the reference, '
+             "so a re-scan no longer looks for it."]
+    if proposed:
+        lines.append(f"{proposed} unreviewed proposal(s) from it in other episodes will be removed.")
+    if decided:
+        lines.append(f"{decided} approved, rejected or edited cut(s) from it are kept as "
+                     "hand-added cuts.")
+    lines.append("Delete it?")
+    return QMessageBox.question(parent, "Delete reference?", "\n\n".join(lines)) == QMessageBox.Yes
 
 
 class TimeEdit(QLineEdit):
@@ -252,6 +267,21 @@ class CutPanel(QWidget):
         self._refresh()
 
     # ---- editing ----
+    def _own_reference(self, c: Cut) -> Reference | None:
+        """The reference whose own span ``c`` is (its cut in the reference episode)."""
+        if self.project is None or not c.reference_id:
+            return None
+        return next((r for r in self.project.references
+                     if r.id == c.reference_id and r.episode == self.file), None)
+
+    def _edited(self, c: Cut) -> None:
+        """Record a time edit. An edited proposal survives a re-scan (``Cut.edited``), and
+        editing a reference's own cut moves the reference with it."""
+        c.edited = True
+        ref = self._own_reference(c)
+        if ref is not None:
+            ref.start, ref.end = c.start, c.end
+
     def _apply_edge(self, value: float) -> bool:
         c = self._current()
         if c is None:
@@ -260,6 +290,7 @@ class CutPanel(QWidget):
             c.start = min(max(0.0, value), c.end - MIN_GAP)
         else:
             c.end = max(min(self.duration, value), c.start + MIN_GAP)
+        self._edited(c)
         return True
 
     def nudge(self, delta: float) -> None:
@@ -313,6 +344,9 @@ class CutPanel(QWidget):
         cuts = self._cuts()
         if not 0 <= index < len(cuts):
             return
+        ref = self._own_reference(cuts[index])
+        if ref is not None and not self._delete_reference(ref, cuts[index]):
+            return
         del cuts[index]
         if not cuts:
             self.selected = -1
@@ -321,6 +355,27 @@ class CutPanel(QWidget):
         elif self.selected > index:
             self.selected -= 1
         self._mutated()
+
+    def _delete_reference(self, ref: Reference, own: Cut) -> bool:
+        """Delete ``ref`` (after asking): its unreviewed, unedited proposals elsewhere go;
+        approved, rejected and edited cuts stay as hand-added cuts. Its scan flags go too.
+        Returns False if the user cancelled."""
+        assert self.project is not None
+        others = [c for st in self.project.episodes.values() for c in st.cuts
+                  if c.reference_id == ref.id and c is not own]
+        dropped = [c for c in others if c.status == "proposed" and not c.edited]
+        if not confirm_delete_reference(self, ref.label, len(dropped), len(others) - len(dropped)):
+            return False
+        gone = {id(c) for c in dropped}
+        stale_flags = {f"No {ref.label} found", f"{ref.label} match weak"}
+        for st in self.project.episodes.values():
+            st.cuts[:] = [c for c in st.cuts if id(c) not in gone]
+            for c in st.cuts:
+                if c.reference_id == ref.id and c is not own:
+                    c.reference_id = None
+            st.flags = [f for f in st.flags if f not in stale_flags]
+        self.project.references.remove(ref)
+        return True
 
     def play_edge(self) -> None:
         c = self._current()
@@ -375,6 +430,7 @@ class CutPanel(QWidget):
                     c.start = t
                 else:
                     c.end = t
+                self._edited(c)
                 self.selected, self.edge = index, edge
                 self._mutated()
                 return True
