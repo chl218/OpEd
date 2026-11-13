@@ -47,3 +47,13 @@ def test_run_timeout_raises_ffmpeg_error():
 
     with pytest.raises(FfmpegError, match="timed out"):
         run([sys.executable, "-c", "import time; time.sleep(5)"], capture=False, timeout=0.3)
+
+
+@pytest.mark.parametrize("platform, hint", [("win32", "winget install Gyan.FFmpeg"),
+                                             ("darwin", "brew install ffmpeg"),
+                                             ("linux", "sudo apt install ffmpeg")])
+def test_install_hint_per_os(monkeypatch, platform, hint):
+    import oped.media as media
+
+    monkeypatch.setattr(media.sys, "platform", platform)
+    assert str(ToolsMissing(["ffmpeg"])).endswith(hint)

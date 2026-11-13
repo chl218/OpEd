@@ -14,7 +14,7 @@ def test_missing_ffmpeg_shows_banner_not_crash(qtbot, monkeypatch):
     monkeypatch.setattr(main_window, "find_tools", raise_(ToolsMissing(["ffmpeg"])))
     w = MainWindow()
     qtbot.addWidget(w)
-    assert "install ffmpeg" in w.banner.text()
+    assert "install ffmpeg" in w.banner.text().lower()
     assert not w.action_scan.isEnabled()
     assert not w.action_export.isEnabled()
 

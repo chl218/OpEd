@@ -9,7 +9,7 @@ Status: all features are implemented and the automated tests pass on Windows. It
 ## Install and run from source
 
 1. Install ffmpeg (includes ffprobe) and make sure both are on PATH:
-   - Windows: `winget install ffmpeg` (open a new shell afterwards)
+   - Windows: `winget install Gyan.FFmpeg` (open a new shell afterwards)
    - macOS: `brew install ffmpeg`
    - Linux (Debian/Ubuntu): `sudo apt install ffmpeg`
 2. Install [uv](https://docs.astral.sh/uv/).

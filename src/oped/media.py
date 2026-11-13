@@ -17,7 +17,7 @@ _KINDS = {"video", "audio", "subtitle", "attachment", "data"}
 
 def _install_hint() -> str:
     if sys.platform == "win32":
-        return "winget install ffmpeg"
+        return "winget install Gyan.FFmpeg"
     if sys.platform == "darwin":
         return "brew install ffmpeg"
     return "sudo apt install ffmpeg"
