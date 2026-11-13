@@ -323,6 +323,85 @@ def test_summarize_counts():
     assert "smart failed" not in text and text.rstrip().endswith("E")
 
 
+# ---------------------------------------------------------------- closing while busy
+
+def test_worker_cancel_stops_at_next_progress(qtbot):
+    cancel = threading.Event()
+    reached = []
+
+    def fn(progress):
+        progress("a", 0.5)
+        reached.append("a")
+        cancel.set()
+        progress("b", 1.0)
+        reached.append("b")
+
+    worker = Worker(fn, cancel)
+    with qtbot.waitSignal(worker.signals.failed, timeout=5000) as blocker:
+        QThreadPool.globalInstance().start(worker)
+    assert blocker.args == ["cancelled"] and reached == ["a"]
+
+
+def test_close_while_busy_wait_keeps_window_and_scan_finishes(qtbot, window_with_project, monkeypatch):
+    w, p = window_with_project
+    gate = threading.Event()
+
+    def feats(name):
+        gate.wait(10)
+        return ed_feats(*REPEATING[name])
+
+    fake_source(monkeypatch, feats)
+    asked = []
+    monkeypatch.setattr(main_window, "confirm_quit_while_busy",
+                        lambda parent, task: asked.append(task) or False)
+    p.references.append(Reference("r", "OP", "OP 1", "E1.mkv", 30, 90))
+    w.show()
+    w.start_scan()
+    try:
+        assert w.close() is False
+        assert asked == ["Scanning"] and w.isVisible()
+    finally:
+        gate.set()
+    qtbot.waitUntil(lambda: idle(w), timeout=20000)
+    assert all(st.scanned for st in p.episodes.values())
+
+
+def test_quit_anyway_during_export_cancels_and_shows_nothing(qtbot, window_with_project, monkeypatch):
+    import oped.export as export_mod
+
+    w, p = window_with_project
+    gate = threading.Event()
+    started = []
+
+    def fake_episode(tools, ep, season_folder, cuts, out_dir, mode="smart", progress=None):
+        progress(0.0)  # like the real export_episode, which reports 0.0 before writing
+        started.append(ep.video.name)
+        gate.wait(10)
+        return EpisodeResult(ep.video.name, "needs_fallback", mode, "x")
+
+    monkeypatch.setattr(export_mod, "export_episode", fake_episode)
+    monkeypatch.setattr(main_window, "confirm_export", lambda parent, names: list(names))
+    monkeypatch.setattr(main_window, "confirm_quit_while_busy", lambda parent, task: True)
+    monkeypatch.setattr(main_window, "ask_fallback", raise_(AssertionError("dialog after close")))
+    w.show()
+    w.start_export()
+    qtbot.waitUntil(lambda: started == ["E1.mkv"], timeout=5000)
+    assert w.close() is True and not w.isVisible()
+    gate.set()
+    assert QThreadPool.globalInstance().waitForDone(10000)
+    qtbot.wait(50)  # deliver any late signals
+    assert started == ["E1.mkv"]  # cancelled before the next episode
+    assert w.summary_dialog is None
+    assert "dialog after close" not in w.banner.text()
+
+
+def test_close_when_idle_is_not_asked(qtbot, window_with_project, monkeypatch):
+    w, p = window_with_project
+    monkeypatch.setattr(main_window, "confirm_quit_while_busy", raise_(AssertionError("asked")))
+    w.show()
+    assert w.close() is True
+
+
 # ---------------------------------------------------------------- carry-over
 
 def test_current_episode_reprobed_after_tools_found(qtbot, tmp_path, monkeypatch):

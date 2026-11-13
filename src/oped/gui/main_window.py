@@ -5,6 +5,7 @@ import copy
 import dataclasses
 import hashlib
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -192,6 +193,20 @@ def ask_fallback(parent, file: str, msg: str) -> str:
     return buttons.get(box.clickedButton(), "skip")
 
 
+def confirm_quit_while_busy(parent, task: str) -> bool:
+    """True to quit anyway while background work runs, False to keep the window open."""
+    box = QMessageBox(parent)
+    box.setWindowTitle("Work in progress")
+    box.setText(f"{task} is still running.\n\nQuitting stops it after the current step; "
+                "files being written are discarded and unfinished results are lost.")
+    wait = box.addButton("Wait", QMessageBox.RejectRole)
+    quit_ = box.addButton("Quit anyway", QMessageBox.DestructiveRole)
+    box.setDefaultButton(wait)
+    box.setEscapeButton(wait)
+    box.exec()
+    return box.clickedButton() is quit_
+
+
 def open_url(path: Path) -> None:
     QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
@@ -241,6 +256,8 @@ class MainWindow(QMainWindow):
         self._worker: Worker | None = None
         self._feats = None
         self._export_ctx: dict = {}
+        self._closed = False  # set once the window closed; late worker signals are ignored
+        self._cancel = threading.Event()
         self.summary_dialog: QMessageBox | None = None
         self.open_output_button: QPushButton | None = None
 
@@ -478,6 +495,13 @@ class MainWindow(QMainWindow):
             self._update_banner()
 
     def closeEvent(self, event) -> None:
+        if self._busy:
+            if not confirm_quit_while_busy(self, self._busy.rstrip(":")):
+                event.ignore()
+                return
+            self._closed = True
+            self._cancel.set()  # the worker stops at its next progress report
+            self.statusBar().clearMessage()
         if self._save_timer.isActive():
             self._save_timer.stop()
             self._autosave()
@@ -603,7 +627,7 @@ class MainWindow(QMainWindow):
         self._update_banner()
 
     def _start_worker(self, fn, on_finished, failure_prefix: str) -> None:
-        worker = Worker(fn)
+        worker = Worker(fn, self._cancel)
         worker.signals.progress.connect(self._on_worker_progress)
         worker.signals.finished.connect(on_finished)
         worker.signals.failed.connect(self._on_worker_failed)
@@ -612,10 +636,14 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_worker_progress(self, name: str, frac: float) -> None:
+        if self._closed:  # quit while running: no dialogs, no widget updates
+            return
         if self._busy:
             self.statusBar().showMessage(f"{self._busy} {name} — {round(frac * 100)}%")
 
     def _on_worker_failed(self, msg: str) -> None:
+        if self._closed:  # quit while running: no dialogs, no widget updates
+            return
         self._set_busy("")
         self.statusBar().showMessage(f"{self._failure_prefix}.", 10000)
         self._set_task_notice(f"{self._failure_prefix}: {msg}")
@@ -664,6 +692,8 @@ class MainWindow(QMainWindow):
         self._start_worker(find, self._on_candidates, "Looking for the opening/ending failed")
 
     def _on_candidates(self, candidates) -> None:
+        if self._closed:  # quit while running: no dialogs, no widget updates
+            return
         if not candidates:
             self._set_busy("")
             self.statusBar().clearMessage()
@@ -713,6 +743,8 @@ class MainWindow(QMainWindow):
         self._start_worker(work, self._on_scanned, "Scan failed")
 
     def _on_scanned(self, scanned: Project) -> None:
+        if self._closed:  # quit while running: no dialogs, no widget updates
+            return
         for name, st in scanned.episodes.items():
             live = self.project.episodes.get(name)
             if live is not None:
@@ -768,6 +800,8 @@ class MainWindow(QMainWindow):
         self._start_worker(work, self._on_exported, "Export failed")
 
     def _on_exported(self, results) -> None:
+        if self._closed:  # quit while running: no dialogs, no widget updates
+            return
         ctx = self._export_ctx
         ctx["results"] = list(results)
         reruns: dict[str, str] = {}
@@ -800,6 +834,8 @@ class MainWindow(QMainWindow):
         self._start_worker(work, self._on_reexported, "Export failed")
 
     def _on_reexported(self, out) -> None:
+        if self._closed:  # quit while running: no dialogs, no widget updates
+            return
         ctx = self._export_ctx
         ctx["results"] = [out.get(r.file, r) for r in ctx["results"]]
         self._finish_export()

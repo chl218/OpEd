@@ -5,6 +5,7 @@ import sys
 
 
 def main() -> int:
+    from PySide6.QtCore import QThreadPool
     from PySide6.QtWidgets import QApplication
 
     from .main_window import MainWindow
@@ -13,7 +14,11 @@ def main() -> int:
     window = MainWindow()
     window.resize(1100, 700)
     window.show()
-    return app.exec()
+    code = app.exec()
+    # A worker cancelled on quit stops at its next progress report; let it finish its
+    # cleanup (.part / work dir removal) before the interpreter shuts down.
+    QThreadPool.globalInstance().waitForDone()
+    return code
 
 
 if __name__ == "__main__":
