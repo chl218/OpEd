@@ -148,6 +148,7 @@ class MainWindow(QMainWindow):
         except Exception as e:  # unexpected failure while locating tools
             self.tools = None
             self._tools_error = f"Could not use ffmpeg: {e}"
+        self.player.tools = self.tools
 
     def set_tool_paths(self, ffmpeg: str, ffprobe: str) -> None:
         if not (_tool_works(ffmpeg) and _tool_works(ffprobe)):
@@ -363,7 +364,8 @@ class MainWindow(QMainWindow):
 
     def trigger_shortcut(self, key: str) -> bool:
         """Run a shortcut action unless a text field has focus. Returns whether it ran."""
-        if isinstance(QApplication.focusWidget(), QLineEdit):
+        fw = QApplication.focusWidget()
+        if isinstance(fw, QLineEdit) and not fw.isReadOnly():
             return False
         fn = self._shortcuts.get(key)
         if fn is None:

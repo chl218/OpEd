@@ -92,16 +92,29 @@ class TimeEdit(QLineEdit):
     """Read-only time field; double-click to edit. Reports text through `submitted`."""
 
     submitted = Signal(str)
+    clicked = Signal()
 
     def __init__(self, text: str):
         super().__init__(text)
         self._orig = text
         self.setReadOnly(True)
+        self.setFocusPolicy(Qt.NoFocus)  # a read-only field must not take focus (or shortcuts)
         self.setFixedWidth(96)
         self.setFrame(False)
         self.editingFinished.connect(self._finished)
 
+    def mousePressEvent(self, event) -> None:
+        if self.isReadOnly():
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+    def _end_edit(self) -> None:
+        self.setReadOnly(True)
+        self.setFrame(False)
+        self.setFocusPolicy(Qt.NoFocus)
+
     def begin_edit(self) -> None:
+        self.setFocusPolicy(Qt.StrongFocus)
         self.setReadOnly(False)
         self.setFrame(True)
         self.selectAll()
@@ -117,8 +130,7 @@ class TimeEdit(QLineEdit):
         if self.isReadOnly():
             return
         if self.text() == self._orig:
-            self.setReadOnly(True)
-            self.setFrame(False)
+            self._end_edit()
             self.mark_invalid(False)
             return
         self.submitted.emit(self.text())
@@ -323,15 +335,25 @@ class CutPanel(QWidget):
         if c is None or self.project is None:
             return
         refs = self.project.references
-        kind = "OP" if c.start < self.duration / 2 else "ED"
-        n = sum(1 for r in refs if r.kind == kind) + 1
-        answer = ask_kind(self, (kind, f"{kind} {n}"))
+        existing = next((r for r in refs if r.id == c.reference_id), None) if c.reference_id else None
+        if existing is not None:
+            default = (existing.kind, existing.label)
+        else:
+            kind = "OP" if c.start < self.duration / 2 else "ED"
+            n = sum(1 for r in refs if r.kind == kind) + 1
+            default = (kind, f"{kind} {n}")
+        answer = ask_kind(self, default)
         if answer is None:
             return
         kind, label = answer
-        ref = Reference(new_id(), kind, label, self.file, c.start, c.end, True)
-        refs.append(ref)
-        c.reference_id = ref.id
+        if existing is not None:  # re-marking updates the reference, never duplicates it
+            existing.kind, existing.label = kind, label
+            existing.episode, existing.start, existing.end = self.file, c.start, c.end
+            existing.confirmed = True
+        else:
+            ref = Reference(new_id(), kind, label, self.file, c.start, c.end, True)
+            refs.append(ref)
+            c.reference_id = ref.id
         self._mutated()
 
     def edit_time(self, index: int, edge: str, text: str) -> bool:
@@ -407,6 +429,7 @@ class CutPanel(QWidget):
             if i == self.selected and edge == self.edge:
                 te.setStyleSheet("QLineEdit { border: 2px solid #2a6df4; }")
             te.submitted.connect(lambda text, i=i, edge=edge: self.edit_time(i, edge, text))
+            te.clicked.connect(lambda i=i: self._click_row(i))
             self._edits[(i, edge)] = te
             lay.addWidget(te)
             if edge == "start":
@@ -422,6 +445,10 @@ class CutPanel(QWidget):
             lay.addWidget(b)
         row.mousePressEvent = lambda _e, i=i: self.select(i)
         return row
+
+    def _click_row(self, i: int) -> None:
+        if i != self.selected:
+            self.select(i)
 
     def _row_action(self, i: int, status: str) -> None:
         cuts = self._cuts()

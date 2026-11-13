@@ -223,3 +223,244 @@ def test_shortcuts_do_not_fire_while_typing(qtbot, tmp_path, monkeypatch):
     assert w.project.episodes["E1.mkv"].cuts[0].status == "proposed"
     assert w.trigger_shortcut("A") is False
     assert w.project.episodes["E1.mkv"].cuts[0].status == "proposed"
+
+
+# ---- Player (with an injected fake media player) ----
+from PySide6.QtCore import QObject, Signal  # noqa: E402
+from PySide6.QtMultimedia import QMediaPlayer  # noqa: E402
+
+from oped.gui import player as player_mod  # noqa: E402
+from oped.gui.player import Player  # noqa: E402
+from oped.media import Tools  # noqa: E402
+
+S = QMediaPlayer.MediaStatus
+
+
+class FakeMP(QObject):
+    positionChanged = Signal("qlonglong")
+    errorOccurred = Signal(object, str)
+    mediaStatusChanged = Signal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.positions, self.sources, self.played, self.paused = [], [], 0, 0
+        self._err = QMediaPlayer.Error.NoError
+
+    def setPosition(self, ms):
+        self.positions.append(ms)
+
+    def setSource(self, url):
+        self.sources.append(url.toLocalFile())
+
+    def play(self):
+        self.played += 1
+
+    def pause(self):
+        self.paused += 1
+
+    def stop(self):
+        pass
+
+    def position(self):
+        return 0
+
+    def error(self):
+        return self._err
+
+
+def make_player(qtbot, loaded=True):
+    pl = Player()
+    qtbot.addWidget(pl)
+    mp = FakeMP()
+    pl._attach(mp)
+    pl.load(Path("ep.mkv"))
+    if loaded:
+        mp.mediaStatusChanged.emit(S.LoadedMedia)
+    return pl, mp
+
+
+def test_player_sequences_spans_and_pauses_after_last(qtbot):
+    pl, mp = make_player(qtbot)
+    pl.play_spans([(0.0, 2.0), (60.0, 65.0)])
+    assert mp.positions == [0]
+    mp.positionChanged.emit(500)
+    assert mp.positions == [0]
+    mp.positionChanged.emit(2000)
+    assert mp.positions == [0, 60000]
+    mp.positionChanged.emit(2100)  # stale, pre-seek position: ignored
+    assert mp.positions == [0, 60000] and mp.paused == 0
+    mp.positionChanged.emit(60100)
+    mp.positionChanged.emit(65000)
+    assert mp.paused == 1 and pl._spans == []
+    mp.positionChanged.emit(70000)  # later seeks do not re-trigger sequencing
+    assert mp.paused == 1
+
+
+def test_player_ignores_stale_position_from_previous_run(qtbot):
+    pl, mp = make_player(qtbot)
+    pl.play_spans([(149.0, 154.0), (225.0, 230.0)])
+    mp.positionChanged.emit(226000)  # left over from the earlier "after" span
+    assert mp.positions == [149000]
+    mp.positionChanged.emit(149500)
+    mp.positionChanged.emit(154000)
+    assert mp.positions == [149000, 225000]
+
+
+def test_player_waits_for_media_to_load(qtbot):
+    pl, mp = make_player(qtbot, loaded=False)
+    pl.play_spans([(10.0, 15.0)])
+    assert mp.positions == [] and mp.played == 0
+    mp.mediaStatusChanged.emit(S.LoadedMedia)
+    assert mp.positions == [10000] and mp.played == 1
+
+
+def test_player_end_of_media_clears_spans(qtbot):
+    pl, mp = make_player(qtbot)
+    pl.play_spans([(95.0, 100.0)])
+    mp.mediaStatusChanged.emit(S.EndOfMedia)
+    assert pl._spans == []
+    mp.positionChanged.emit(96000)
+    assert mp.positions == [95000]
+
+
+def fake_run(cmds):
+    def _run(cmd, **kw):
+        cmds.append(list(cmd))
+        Path(cmd[-1]).write_bytes(b"x")
+
+    return _run
+
+
+def test_player_error_before_play_then_fallback_generates_previews(qtbot, monkeypatch):
+    cmds = []
+    monkeypatch.setattr(player_mod, "run", fake_run(cmds))
+    pl, mp = make_player(qtbot)
+    pl.tools = Tools("ffmpeg", "ffprobe")
+    errors = []
+    pl.error_occurred.connect(errors.append)
+    mp._err = QMediaPlayer.Error.ResourceError
+    mp.errorOccurred.emit(QMediaPlayer.Error.ResourceError, "cannot decode")  # no spans yet
+    assert errors and not cmds
+    pl.play_spans([(5.0, 8.0), (60.0, 80.0)])  # goes straight to previews
+    assert len(cmds) == 2
+    for c in cmds:
+        for flag in ("-sn", "-dn", "-pix_fmt", "yuv420p", "libx264", "veryfast", "aac", "0:v:0", "0:a:0?"):
+            assert flag in c
+    assert cmds[0][cmds[0].index("-t") + 1] == "3.000"
+    assert cmds[1][cmds[1].index("-t") + 1] == "10.000"
+    tmp = pl._tmp
+    assert tmp.exists() and mp.sources[-1].endswith("clip0.mp4")
+    mp.mediaStatusChanged.emit(S.EndOfMedia)
+    assert mp.sources[-1].endswith("clip1.mp4")
+    mp.mediaStatusChanged.emit(S.EndOfMedia)
+    assert mp.paused == 1 and not tmp.exists() and not pl._in_preview
+
+
+def test_player_error_during_play_falls_back(qtbot, monkeypatch):
+    cmds = []
+    monkeypatch.setattr(player_mod, "run", fake_run(cmds))
+    pl, mp = make_player(qtbot)
+    pl.tools = Tools("ffmpeg", "ffprobe")
+    pl.play_spans([(5.0, 8.0)])
+    mp.errorOccurred.emit(QMediaPlayer.Error.FormatError, "bad")
+    assert len(cmds) == 1 and pl._in_preview
+
+
+def test_player_interrupted_preview_leaves_no_stale_state(qtbot, monkeypatch):
+    cmds = []
+    monkeypatch.setattr(player_mod, "run", fake_run(cmds))
+    pl, mp = make_player(qtbot)
+    pl.tools = Tools("ffmpeg", "ffprobe")
+    pl._source_failed = True
+    pl.play_spans([(5.0, 8.0), (20.0, 25.0)])
+    tmp = pl._tmp
+    pl.load(Path("other.mkv"))  # interrupts the preview
+    assert not tmp.exists() and pl._clips == [] and not pl._in_preview
+    n = len(mp.sources)
+    mp.mediaStatusChanged.emit(S.EndOfMedia)  # old source's end must be harmless
+    assert len(mp.sources) == n and pl._clip_i == 0
+    pl._source_failed = True
+    pl.play_spans([(1.0, 2.0)])
+    pl.play_spans([(3.0, 4.0)])  # second fallback replaces the first
+    mp.mediaStatusChanged.emit(S.EndOfMedia)
+    assert not pl._in_preview
+
+
+def test_player_missing_backend_reports_error(qtbot, monkeypatch):
+    def boom(self):
+        raise RuntimeError("no backend")
+
+    monkeypatch.setattr(Player, "_create_backend", boom)
+    pl = Player()
+    qtbot.addWidget(pl)
+    errors = []
+    pl.error_occurred.connect(errors.append)
+    pl.load(Path("ep.mkv"))
+    pl.play_spans([(0, 1)])
+    pl.seek(3)
+    assert errors and "no backend" in errors[0]
+    assert pl.position() == 3.0
+
+
+def test_window_passes_tools_to_player(qtbot, tmp_path):
+    w, fp = _window(qtbot, tmp_path)
+    assert fp.tools is w.tools
+
+
+# ---- real key events and focus behaviour ----
+def _ready_window(qtbot, tmp_path, monkeypatch, cuts):
+    w, fp = _window(qtbot, tmp_path)
+    w.project.episodes["E1.mkv"].cuts.extend(cuts)
+    monkeypatch.setattr(main_window, "probe", lambda t, p: info(p))
+    w.tools = w.tools or object()
+    w.show()
+    qtbot.waitExposed(w)
+    w.episode_list.setCurrentRow(0)
+    return w, fp
+
+
+def test_real_key_events_trigger_shortcuts(qtbot, tmp_path, monkeypatch):
+    w, fp = _ready_window(qtbot, tmp_path, monkeypatch, [Cut("a", 10, 20)])
+    cuts = w.project.episodes["E1.mkv"].cuts
+    w.activateWindow()
+    qtbot.waitUntil(w.isActiveWindow, timeout=3000)
+    QTest.keyClick(w, Qt.Key_Tab)
+    assert w.cut_panel.edge == "end"
+    QTest.keyClick(w, Qt.Key_Right)
+    assert cuts[0].end == pytest.approx(20.1)
+    QTest.keyClick(w, Qt.Key_Space)
+    assert fp.spans
+    QTest.keyClick(w, Qt.Key_A)
+    assert cuts[0].status == "approved"
+    QTest.keyClick(w, Qt.Key_X)
+    assert cuts[0].status == "rejected"
+
+
+def test_clicking_a_time_selects_row_and_keeps_shortcuts(qtbot, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication, QLineEdit
+
+    w, fp = _ready_window(qtbot, tmp_path, monkeypatch, [Cut("a", 10, 20), Cut("b", 30, 40)])
+    cuts = w.project.episodes["E1.mkv"].cuts
+    assert w.cut_panel.selected == 0
+    edit = w.cut_panel.time_edit_widget(1, "start")
+    QTest.mouseClick(edit, Qt.LeftButton)
+    assert w.cut_panel.selected == 1
+    fw = QApplication.focusWidget()
+    assert not (isinstance(fw, QLineEdit) and not fw.isReadOnly())
+    assert w.trigger_shortcut("X") is True
+    assert cuts[1].status == "rejected" and cuts[0].status == "proposed"
+
+
+def test_mark_reference_twice_updates_not_duplicates(qtbot, monkeypatch):
+    p, fp, panel = make_panel(qtbot, [Cut("c", 154.0, 225.0)])
+    panel.select(0)
+    answers = iter([("OP", "OP 1"), ("ED", "Renamed")])
+    monkeypatch.setattr(cut_panel, "ask_kind", lambda parent, default: next(answers))
+    panel.mark_reference()
+    panel.nudge(1.0)
+    panel.mark_reference()
+    assert len(p.references) == 1
+    r = p.references[0]
+    assert (r.kind, r.label) == ("ED", "Renamed")
+    c = p.episodes["E1.mkv"].cuts[0]
+    assert c.reference_id == r.id and r.start == c.start
