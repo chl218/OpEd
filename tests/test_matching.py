@@ -4,9 +4,9 @@ import time
 import numpy as np
 import pytest
 
-from fixtures import OP_PCM, episode, melody
+from fixtures import OP_PCM, episode, episode_with, melody
 from oped.fingerprint import FPS, SAMPLE_RATE, features_from_pcm
-from oped.matching import Match, find_reference
+from oped.matching import Candidate, Match, discover_references, find_reference
 from oped.project import HIGH, WEAK
 
 SR = SAMPLE_RATE
@@ -121,3 +121,103 @@ def test_sub_frame_offset_and_loud_overlay():
     m = find_reference(ref_feats(), ep_feats(300, overlay=0.6))
     assert m.start == pytest.approx(300, abs=0.3) and m.end == pytest.approx(360, abs=0.3)
     assert m.confidence >= WEAK
+
+
+# ---- reference discovery without hints ----
+
+@functools.lru_cache(maxsize=None)
+def epw_feats(*args, **kw):
+    return feats(episode_with(*args, **kw))
+
+
+def _season(spec):
+    """spec: {name: (op_at, ed_at, seed[, kwargs])} -> features dict in insertion order."""
+    out = {}
+    for name, s in spec.items():
+        kw = s[3] if len(s) > 3 else {}
+        out[name] = epw_feats(s[0], s[1], s[2], **kw)
+    return out
+
+
+def test_discovers_op_and_ed_across_season():
+    ep = {f"E{i}.mkv": feats(episode_with(op_at=30 + i * 7, ed_at=1200 + i, seed=i)) for i in range(1, 7)}
+    ep["E1.mkv"] = feats(episode_with(op_at=None, ed_at=1201, seed=1))   # E1 has no OP
+    c = discover_references(ep)
+    assert [x.kind for x in c] == ["ED", "OP"]
+    op = next(x for x in c if x.kind == "OP")
+    assert op.end - op.start == pytest.approx(60, abs=1) and op.support >= 5
+
+
+def test_no_repeats_no_candidates():
+    assert discover_references({f"E{i}": feats(episode(None, seed=i)) for i in range(4)}) == []
+
+
+def test_candidate_times_are_in_its_episode():
+    spec = {f"E{i}": (30 + i * 7, 1200 + i, i) for i in range(1, 5)}
+    c = discover_references(_season(spec))
+    assert [x.kind for x in c] == ["ED", "OP"]
+    for x in c:
+        assert isinstance(x, Candidate)
+        op_at, ed_at, _ = spec[x.episode]
+        at, length = (ed_at, 70) if x.kind == "ED" else (op_at, 60)
+        assert x.start == pytest.approx(at, abs=1)
+        assert x.end == pytest.approx(at + length, abs=1)
+        assert x.support == 4
+
+
+def test_empty_and_single_episode_season():
+    assert discover_references({}) == []
+    assert discover_references(_season({"E1": (40, 1200, 1)})) == []
+
+
+def test_two_episode_season():
+    c = discover_references(_season({"E1": (40, 1200, 1), "E2": (95, 1180, 2)}))
+    assert [(x.kind, x.episode, x.support) for x in c] == [("ED", "E1", 2), ("OP", "E1", 2)]
+    op = c[1]
+    assert op.start == pytest.approx(40, abs=1) and op.end == pytest.approx(100, abs=1)
+
+
+def test_op_at_sub_block_offsets():
+    # Offsets that are not multiples of the 0.5 s discovery block (nor of a 0.1 s frame).
+    spec = {"E1": (30.33, None, 1), "E2": (101.62, None, 2), "E3": (55.17, None, 3),
+            "E4": (200.88, None, 4)}
+    c = discover_references(_season(spec))
+    assert [x.kind for x in c] == ["OP"]
+    op = c[0]
+    assert op.support == 4
+    assert op.start == pytest.approx(spec[op.episode][0], abs=1)
+    assert op.end - op.start == pytest.approx(60, abs=1)
+
+
+def test_shortened_op_in_one_episode():
+    spec = {"E1": (40, 1200, 1), "E2": (50, 1200, 2, {"op_trim": 15}),
+            "E3": (60, 1200, 3), "E4": (70, 1200, 4)}
+    c = discover_references(_season(spec))
+    assert [x.kind for x in c] == ["ED", "OP"]
+    op = c[1]
+    assert op.support == 4
+    assert op.end - op.start == pytest.approx(60, abs=1)
+
+
+def test_episode_without_op_or_ed_breaks_pairs_but_not_discovery():
+    # E3 (a recap) has neither OP nor ED, so pairs E2-E3 and E3-E4 find nothing.
+    spec = {"E1": (40, 1200, 1), "E2": (45, 1205, 2), "E3": (None, None, 3),
+            "E4": (50, 1210, 4), "E5": (55, 1215, 5)}
+    c = discover_references(_season(spec))
+    assert [(x.kind, x.support) for x in c] == [("ED", 4), ("OP", 4)]
+
+
+def test_short_episodes_do_not_crash():
+    spec = {"E1": (None, None, 1, {"total": 20}), "E2": (None, None, 2, {"total": 3}),
+            "E3": (None, None, 3, {"total": 0.05})}
+    assert discover_references(_season(spec)) == []
+    short = {"E1": (5, None, 1, {"total": 100}), "E2": (10, None, 2, {"total": 100})}
+    c = discover_references(_season(short))   # OP spans more than the 40 % region
+    assert all(x.kind == "OP" for x in c)
+
+
+def test_discovery_is_fast():
+    ep = {f"E{i}": epw_feats(30 + i * 7, 1200 + i, i) for i in range(1, 7)}
+    t0 = time.perf_counter()
+    discover_references(ep)
+    assert time.perf_counter() - t0 < 10

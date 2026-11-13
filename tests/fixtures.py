@@ -344,3 +344,23 @@ def episode(op_at, op_len=60, total=1300, seed=0, op_seed=7, op_trim=0, overlay=
         op += overlay * melody(5000 + seed, len(op) / _SR + 1)[: len(op)]
     pcm[pos:pos + len(op)] = op
     return pcm
+
+
+ED_SECS = 70
+ED_PCM = melody(8, ED_SECS)
+
+
+def episode_with(op_at, ed_at, seed, total=1300, op_trim=0, ed_trim=0):
+    """``episode()`` (OP_PCM at ``op_at``) plus the 70 s ED (melody seed 8) at ``ed_at``.
+
+    Either position may be None for "absent". The background 'dialogue' is the per-seed
+    melody of ``episode()``, so it differs between seeds and never repeats across episodes.
+    """
+    pcm = episode(op_at, total=total, seed=seed, op_trim=op_trim)
+    if ed_at is None:
+        return pcm
+    ed = ED_PCM[: len(ED_PCM) - round(ed_trim * _SR)]
+    pos = round(ed_at * _SR)
+    ed = ed[: max(0, len(pcm) - pos)]
+    pcm[pos:pos + len(ed)] = ed
+    return pcm
