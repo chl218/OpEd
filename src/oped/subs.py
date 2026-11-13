@@ -13,19 +13,18 @@ TEXT_SIDECARS = {".ass", ".ssa", ".srt", ".vtt"}
 
 
 def _retime_packets(src: Path, out: Path, tm: TimeMap, indices: list[int] | None,
-                    text_streams: set[int] | None = None) -> bool:
+                    text_streams: set[int]) -> bool:
     """Demux subtitle streams of ``src`` (PyAV stream indices), retime, mux into ``out``.
 
-    ``text_streams`` holds the indices to treat as text; all others are image streams.
-    Returns False (and writes nothing) when no stream or no packet survives.
+    ``text_streams`` holds the indices to treat as text (callers decide this from
+    ``StreamInfo.is_text_sub``, i.e. ``media.TEXT_SUB_CODECS``); all others are image
+    streams. Returns False (and writes nothing) when no stream or no packet survives.
     """
     out.parent.mkdir(parents=True, exist_ok=True)
     with av.open(str(src)) as inp:
         subs = [s for s in inp.streams if s.type == "subtitle" and (indices is None or s.index in indices)]
         if not subs:
             return False
-        if text_streams is None:
-            text_streams = {s.index for s in subs if s.codec_context.name in ("ass", "ssa", "subrip", "srt", "mov_text", "webvtt", "text")}
         by_index = {s.index: s for s in subs}
         items = []  # (out_pts_sec, order, stream_index, packet, out_dur_sec)
         for n, pkt in enumerate(inp.demux(*subs)):
