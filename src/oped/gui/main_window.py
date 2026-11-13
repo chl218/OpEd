@@ -1,22 +1,32 @@
 """Main window: folder open, episode list, banner, autosave."""
 from __future__ import annotations
 
+import copy
+import dataclasses
 import hashlib
 import shutil
 import time
 from pathlib import Path
+from typing import Callable
 
 import platformdirs
 
-from PySide6.QtCore import QSettings, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QKeySequence, QShortcut
+from PySide6.QtCore import QSettings, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QApplication,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSplitter,
     QToolBar,
@@ -25,14 +35,179 @@ from PySide6.QtWidgets import (
 )
 
 from ..discovery import Season, discover
+from ..export import EpisodeResult, existing_outputs, export_episode, export_season, output_folder
+from ..fingerprint import default_cache_dir
 from ..media import Tools, ToolsMissing, find_tools, probe, run
-from ..project import EpisodeState, Project, load_project, project_path, save_project
-from .cut_panel import CutPanel
+from ..project import (EpisodeState, Project, Reference, confidence_level, load_project,
+                       project_path, save_project)
+from ..scan import make_feature_source, reference_candidates, scan
+from .cut_panel import CutPanel, format_time
 from .episode_list import EpisodeList
 from .player import Player
+from .workers import Worker
 
 AUTOSAVE_MS = 500
 TOOL_CHECK_TIMEOUT = 5.0
+NO_CANDIDATES_MESSAGE = ("No repeating opening/ending found — mark one by hand: select an "
+                         "episode, Ctrl+N, then Mark as reference.")
+OVERWRITE_LIST_MAX = 10
+# Shortcuts that only navigate or play; everything else edits cuts and is blocked while busy.
+_SAFE_WHILE_BUSY = {"Space", "Tab", "Up", "Down", "PageUp", "PageDown"}
+FALLBACK_CHOICES = (
+    ("reencode", "Exact re-encode (slow)"),
+    ("keyframe", "Fast keyframe cut (may keep ~2 s)"),
+    ("skip", "Skip"),
+)
+
+
+# ---------------------------------------------------------------- dialogs
+# Module-level so tests can monkeypatch them on ``main_window``.
+
+@dataclasses.dataclass
+class CandidateRow:
+    ref: Reference
+    support: int
+    check: QCheckBox
+    label: QLineEdit
+    play: QPushButton
+    default_label: str
+
+    def text(self) -> str:
+        return (f"{self.ref.kind}  {self.ref.episode}  "
+                f"{format_time(self.ref.start)}–{format_time(self.ref.end)}  "
+                f"found in {self.support} episodes")
+
+
+class CandidatesDialog(QDialog):
+    """Lists reference candidates; the checked ones become confirmed references."""
+
+    def __init__(self, parent, candidates: list[tuple[Reference, int]],
+                 play: Callable[[Reference], None]):
+        super().__init__(parent)
+        self.setWindowTitle("Confirm opening/ending")
+        col = QVBoxLayout(self)
+        col.addWidget(QLabel("These pieces repeat across episodes. Tick the ones to cut "
+                             "everywhere; Play previews one."))
+        grid = QGridLayout()
+        for c, h in enumerate(("Use", "Kind", "Episode", "Span", "Support", "Label", "")):
+            grid.addWidget(QLabel(f"<b>{h}</b>"), 0, c)
+        counts: dict[str, int] = {}
+        self.rows: list[CandidateRow] = []
+        for i, (ref, support) in enumerate(candidates, start=1):
+            counts[ref.kind] = counts.get(ref.kind, 0) + 1
+            default = f"{ref.kind} {counts[ref.kind]}"
+            check = QCheckBox()
+            check.setChecked(True)
+            label = QLineEdit(default)
+            play_button = QPushButton("Play")
+            play_button.clicked.connect(lambda _checked=False, r=ref: play(r))
+            row = CandidateRow(ref, support, check, label, play_button, default)
+            self.rows.append(row)
+            for c, wdg in enumerate((check, QLabel(ref.kind), QLabel(ref.episode),
+                                     QLabel(f"{format_time(ref.start)}–{format_time(ref.end)}"),
+                                     QLabel(f"{support} episodes"), label, play_button)):
+                grid.addWidget(wdg, i, c)
+        col.addLayout(grid)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Scan")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        col.addWidget(buttons)
+
+    def chosen(self) -> list[Reference]:
+        """Copies of the checked candidates, confirmed and labelled (inputs untouched)."""
+        return [dataclasses.replace(r.ref, label=r.label.text().strip() or r.default_label,
+                                    confirmed=True)
+                for r in self.rows if r.check.isChecked()]
+
+
+def confirm_candidates(parent, candidates: list[tuple[Reference, int]],
+                       play: Callable[[Reference], None]) -> list[Reference] | None:
+    """The confirmed references, or None if the user cancelled."""
+    dlg = CandidatesDialog(parent, candidates, play)
+    return dlg.chosen() if dlg.exec() == QDialog.Accepted else None
+
+
+class EpisodePickDialog(QDialog):
+    def __init__(self, parent, names: list[str]):
+        super().__init__(parent)
+        self.setWindowTitle("Export episodes")
+        col = QVBoxLayout(self)
+        col.addWidget(QLabel("Episodes to export:"))
+        self.list = QListWidget()
+        for n in names:
+            item = QListWidgetItem(n)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            self.list.addItem(item)
+        col.addWidget(self.list, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Export")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        col.addWidget(buttons)
+
+    def selected(self) -> list[str]:
+        return [self.list.item(i).text() for i in range(self.list.count())
+                if self.list.item(i).checkState() == Qt.Checked]
+
+
+def confirm_export(parent, names: list[str]) -> list[str] | None:
+    """The episodes to export, or None if the user cancelled."""
+    dlg = EpisodePickDialog(parent, names)
+    return dlg.selected() if dlg.exec() == QDialog.Accepted else None
+
+
+def _cuts_word(n: int) -> str:
+    return f"{n} cut" if n == 1 else f"{n} cuts"
+
+
+def confirm_unreviewed(parent, n: int) -> bool:
+    return QMessageBox.question(
+        parent, "Cuts not reviewed",
+        f"{_cuts_word(n)} not reviewed. Only approved cuts are applied, so these will not "
+        "be cut. Export anyway?",
+    ) == QMessageBox.Yes
+
+
+def confirm_overwrite(parent, names: list[str]) -> bool:
+    shown = names[:OVERWRITE_LIST_MAX]
+    more = len(names) - len(shown)
+    listing = "\n".join(shown) + (f"\n… and {more} more" if more else "")
+    return QMessageBox.question(
+        parent, "Overwrite exported files?",
+        f"These files already exist in the output folder and will be replaced:\n\n{listing}",
+    ) == QMessageBox.Yes
+
+
+def ask_fallback(parent, file: str, msg: str) -> str:
+    """'reencode', 'keyframe' or 'skip' for an episode whose smart cut failed."""
+    box = QMessageBox(parent)
+    box.setWindowTitle("Smart cut failed")
+    box.setText(f"Smart cut failed for {file}:\n{msg}\n\nHow should this episode be cut?")
+    buttons = {box.addButton(text, QMessageBox.AcceptRole): key for key, text in FALLBACK_CHOICES}
+    skip = next(b for b, k in buttons.items() if k == "skip")
+    box.setEscapeButton(skip)
+    box.exec()
+    return buttons.get(box.clickedButton(), "skip")
+
+
+def open_url(path: Path) -> None:
+    QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+
+def summarize(results: list[EpisodeResult], skipped: set[str]) -> str:
+    trimmed = [r for r in results if r.status == "trimmed"]
+    copied = [r for r in results if r.status == "copied"]
+    failed = [r for r in results if r.status not in ("trimmed", "copied") and r.file not in skipped]
+    skip = [r.file for r in results if r.file in skipped]
+    lines = [f"Export finished: {len(trimmed)} trimmed, {len(copied)} copied unchanged, "
+             f"{len(failed)} failed, {len(skip)} skipped."]
+    if failed:
+        lines += ["", "Failed:"] + [f"  {r.file}: {r.message or r.status}" for r in failed]
+    if skip:
+        lines += ["", "Skipped:"] + [f"  {f}" for f in skip]
+    return "\n".join(lines)
 
 
 def _tool_works(path: str) -> bool:
@@ -60,6 +235,14 @@ class MainWindow(QMainWindow):
         self._tools_refusal = ""
         self._notices: list[str] = []
         self._episode_notice = ""
+        self._task_notice = ""
+        self._busy = ""  # non-empty while a background scan/export owns the project
+        self._failure_prefix = ""
+        self._worker: Worker | None = None
+        self._feats = None
+        self._export_ctx: dict = {}
+        self.summary_dialog: QMessageBox | None = None
+        self.open_output_button: QPushButton | None = None
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -116,9 +299,9 @@ class MainWindow(QMainWindow):
         self.action_approve = QAction("Approve all high", self)
         self.action_export = QAction("Export", self)
         self.action_open.triggered.connect(self._choose_folder)
-        self.action_scan.triggered.connect(self._scan)
-        self.action_approve.triggered.connect(self._approve_all_high)
-        self.action_export.triggered.connect(self._export)
+        self.action_scan.triggered.connect(self.start_scan)
+        self.action_approve.triggered.connect(self.approve_all_high)
+        self.action_export.triggered.connect(self.start_export)
         for a in (self.action_open, self.action_scan, self.action_approve, self.action_export):
             bar.addAction(a)
 
@@ -159,6 +342,7 @@ class MainWindow(QMainWindow):
             )
             self._update_actions()
             self._update_banner()
+            self._reload_current_episode()
             return
         self._tools_refusal = ""
         s = QSettings("oped", "oped")
@@ -168,6 +352,13 @@ class MainWindow(QMainWindow):
         self._try_find_tools(ffmpeg, ffprobe)
         self._update_actions()
         self._update_banner()
+        self._reload_current_episode()
+
+    def _reload_current_episode(self) -> None:
+        """Re-probe the selected episode (e.g. once ffmpeg has become available)."""
+        cur = self.episode_list.currentItem()
+        if cur is not None and self.tools is not None:
+            self._on_episode_selected(cur.data(Qt.UserRole))
 
     def choose_ffmpeg(self) -> None:
         ff, _ = QFileDialog.getOpenFileName(self, "Locate ffmpeg")
@@ -188,6 +379,8 @@ class MainWindow(QMainWindow):
         lines.extend(self._notices)
         if self._episode_notice:
             lines.append(self._episode_notice)
+        if self._task_notice:
+            lines.append(self._task_notice)
         if self.season is not None:
             lines.extend(self.season.warnings)
         self.banner.setText("\n".join(lines))
@@ -198,9 +391,11 @@ class MainWindow(QMainWindow):
         has_work = (
             self.tools is not None and self.project is not None and bool(self.project.episodes)
         )
+        has_work = has_work and not self._busy
         self.action_scan.setEnabled(has_work)
         self.action_export.setEnabled(has_work)
         self.action_approve.setEnabled(has_work)
+        self.action_open.setEnabled(not self._busy)
 
     # ---- folder / project ----
     def _choose_folder(self) -> None:
@@ -209,11 +404,14 @@ class MainWindow(QMainWindow):
             self.open_folder(Path(d))
 
     def open_folder(self, path: Path) -> None:
+        if self._busy:
+            return
         if self._save_timer.isActive():
             self._save_timer.stop()
             self._autosave()
         self._notices = []
         self._episode_notice = ""
+        self._task_notice = ""
         self.cut_panel.clear()
         path = Path(path)
         try:
@@ -364,6 +562,8 @@ class MainWindow(QMainWindow):
 
     def trigger_shortcut(self, key: str) -> bool:
         """Run a shortcut action unless a text field has focus. Returns whether it ran."""
+        if self._busy and key not in _SAFE_WHILE_BUSY:
+            return False
         fw = QApplication.focusWidget()
         if isinstance(fw, QLineEdit) and not fw.isReadOnly():
             return False
@@ -380,12 +580,249 @@ class MainWindow(QMainWindow):
         row = self.episode_list.currentRow()
         self.episode_list.setCurrentRow(min(n - 1, max(0, row + step if row >= 0 else 0)))
 
-    # ---- Task 13 stubs ----
-    def _scan(self) -> None:
-        """TODO(Task 13): run the project scan."""
+    # ---- background work ----
+    # Threading model: a worker never sees the live Project. Scan and export run on a
+    # deep copy taken on the GUI thread; scan results are copied back on the GUI thread
+    # when the worker finishes. While a worker runs the window is "busy": Open/Scan/
+    # Approve/Export are disabled, the cut panel is disabled and editing shortcuts are
+    # ignored, so the live project cannot change under the copy and the copy-back loses
+    # no edits. Navigation (episode list, playback) keeps working.
+    def _ready(self) -> bool:
+        return (not self._busy and self.tools is not None and self.season is not None
+                and self.project is not None)
 
-    def _approve_all_high(self) -> None:
-        """TODO(Task 13): approve every high-confidence cut."""
+    def _set_busy(self, text: str) -> None:
+        self._busy = text
+        self.cut_panel.setEnabled(not text)
+        self._update_actions()
+        if text:
+            self.statusBar().showMessage(text + "…")
 
-    def _export(self) -> None:
-        """TODO(Task 13): export trimmed copies."""
+    def _set_task_notice(self, text: str) -> None:
+        self._task_notice = text
+        self._update_banner()
+
+    def _start_worker(self, fn, on_finished, failure_prefix: str) -> None:
+        worker = Worker(fn)
+        worker.signals.progress.connect(self._on_worker_progress)
+        worker.signals.finished.connect(on_finished)
+        worker.signals.failed.connect(self._on_worker_failed)
+        self._failure_prefix = failure_prefix
+        self._worker = worker  # keep it alive until its signals have been delivered
+        worker.start()
+
+    def _on_worker_progress(self, name: str, frac: float) -> None:
+        if self._busy:
+            self.statusBar().showMessage(f"{self._busy} {name} — {round(frac * 100)}%")
+
+    def _on_worker_failed(self, msg: str) -> None:
+        self._set_busy("")
+        self.statusBar().showMessage(f"{self._failure_prefix}.", 10000)
+        self._set_task_notice(f"{self._failure_prefix}: {msg}")
+
+    def _refresh_views(self) -> None:
+        """Re-read the project into the episode list and the cut panel."""
+        if self.project is None:
+            return
+        self.episode_list.refresh(self.project)
+        cp = self.cut_panel
+        if cp.project is self.project and cp.file in self.project.episodes:
+            keep = cp.selected
+            cp.set_episode(self.project, cp.file, cp.duration, cp.fps)
+            if keep >= 0:
+                cp.select(keep)
+
+    # ---- scan ----
+    def start_scan(self) -> None:
+        if not self._ready():
+            return
+        self._set_task_notice("")
+        feats = make_feature_source(self.tools, self.season, default_cache_dir())
+        self._feats = feats
+        if any(r.confirmed for r in self.project.references):
+            self._run_scan()
+            return
+        names = [ep.video.name for ep in self.season.episodes if ep.video.name in self.project.episodes]
+        view = Project(self.project.folder, [], {n: self.project.episodes[n] for n in names})
+
+        def find(progress):
+            done = [0]
+
+            def named(name: str):
+                try:
+                    f = feats(name)
+                except Exception as e:  # noqa: BLE001 - name the episode that broke the search
+                    reason = e.args[0] if isinstance(e, KeyError) and e.args else e
+                    raise RuntimeError(f"could not read {name}: {reason}") from e
+                done[0] += 1
+                progress(name, done[0] / len(names))
+                return f
+
+            return reference_candidates(view, named)
+
+        self._set_busy("Looking for the opening/ending:")
+        self._start_worker(find, self._on_candidates, "Looking for the opening/ending failed")
+
+    def _on_candidates(self, candidates) -> None:
+        if not candidates:
+            self._set_busy("")
+            self.statusBar().clearMessage()
+            self._set_task_notice(NO_CANDIDATES_MESSAGE)
+            return
+        self._played_candidate = False
+        chosen = confirm_candidates(self, list(candidates), self._play_candidate)
+        if self._played_candidate:
+            self._restore_player()
+        if not chosen:
+            self._set_busy("")
+            self.statusBar().showMessage(
+                "Scan cancelled." if chosen is None else "No reference ticked; scan not run.", 10000)
+            return
+        self.project.references.extend(chosen)
+        self.mark_dirty()
+        self._run_scan()
+
+    def _play_candidate(self, ref: Reference) -> None:
+        self._played_candidate = True
+        try:
+            self.player.load(Path(self.season.folder) / ref.episode)
+            self.player.play_spans([(ref.start, ref.end)])
+        except Exception as e:  # noqa: BLE001
+            self._set_episode_notice(f"Could not play {ref.episode}: {e}")
+
+    def _restore_player(self) -> None:
+        """Put the selected episode back into the player after a candidate preview."""
+        cur = self.episode_list.currentItem()
+        if cur is None or self.season is None:
+            return
+        name = cur.data(Qt.UserRole)
+        try:
+            self.player.load(Path(self.season.folder) / name)
+        except Exception as e:  # noqa: BLE001
+            self._set_episode_notice(f"Could not load {name} into the player: {e}")
+
+    def _run_scan(self) -> None:
+        snapshot = copy.deepcopy(self.project)
+        feats = self._feats
+
+        def work(progress):
+            scan(snapshot, feats, progress)
+            return snapshot
+
+        self._set_busy("Scanning")
+        self._start_worker(work, self._on_scanned, "Scan failed")
+
+    def _on_scanned(self, scanned: Project) -> None:
+        for name, st in scanned.episodes.items():
+            live = self.project.episodes.get(name)
+            if live is not None:
+                live.cuts, live.flags, live.scanned = st.cuts, st.flags, st.scanned
+        self._set_busy("")
+        self._refresh_views()
+        self.mark_dirty()
+        flagged = sum(1 for st in scanned.episodes.values() if st.flags)
+        self.statusBar().showMessage(
+            f"Scan finished: {len(scanned.episodes)} episodes, {flagged} flagged.", 10000)
+
+    # ---- approve ----
+    def approve_all_high(self) -> None:
+        if self.project is None or self._busy:
+            return
+        n = 0
+        for st in self.project.episodes.values():
+            for c in st.cuts:
+                if c.status == "proposed" and confidence_level(c.confidence) in ("high", "manual"):
+                    c.status = "approved"
+                    n += 1
+        if n:
+            self.mark_dirty()
+            self._refresh_views()
+        self.statusBar().showMessage(f"Approved {_cuts_word(n)}.", 10000)
+
+    # ---- export ----
+    def start_export(self) -> None:
+        if not self._ready():
+            return
+        names = [ep.video.name for ep in self.season.episodes if ep.video.name in self.project.episodes]
+        files = confirm_export(self, names)
+        if not files:
+            return
+        unreviewed = sum(1 for f in files for c in self.project.episodes[f].cuts
+                         if c.status == "proposed")
+        if unreviewed and not confirm_unreviewed(self, unreviewed):
+            return
+        out_dir = output_folder(self.season.folder)
+        existing = existing_outputs(self.season, files)
+        if existing and not confirm_overwrite(self, [str(p.relative_to(out_dir)) for p in existing]):
+            return
+        self._set_task_notice("")
+        snapshot = copy.deepcopy(self.project)
+        tools, season = self.tools, self.season
+        self._export_ctx = {"tools": tools, "season": season, "project": snapshot,
+                            "out_dir": out_dir, "results": [], "skipped": set()}
+
+        def work(progress):
+            return export_season(tools, snapshot, season, list(files), progress=progress)
+
+        self._set_busy("Exporting")
+        self._start_worker(work, self._on_exported, "Export failed")
+
+    def _on_exported(self, results) -> None:
+        ctx = self._export_ctx
+        ctx["results"] = list(results)
+        reruns: dict[str, str] = {}
+        for r in ctx["results"]:
+            if r.status == "needs_fallback":
+                choice = ask_fallback(self, r.file, r.message)
+                if choice in ("reencode", "keyframe"):
+                    reruns[r.file] = choice
+                else:
+                    ctx["skipped"].add(r.file)
+        if not reruns:
+            self._finish_export()
+            return
+        tools, season, snapshot, out_dir = ctx["tools"], ctx["season"], ctx["project"], ctx["out_dir"]
+        by_name = {ep.video.name: ep for ep in season.episodes}
+
+        def work(progress):
+            out: dict[str, EpisodeResult] = {}
+            for f, mode in reruns.items():
+                ep = by_name.get(f)
+                if ep is None:
+                    out[f] = EpisodeResult(f, "failed", mode, "episode not found in the season folder")
+                    continue
+                out[f] = export_episode(tools, ep, season.folder, snapshot.approved_intervals(f),
+                                        out_dir, mode=mode,
+                                        progress=lambda x, f=f: progress(f, x))
+            return out
+
+        self._set_busy("Re-exporting")
+        self._start_worker(work, self._on_reexported, "Export failed")
+
+    def _on_reexported(self, out) -> None:
+        ctx = self._export_ctx
+        ctx["results"] = [out.get(r.file, r) for r in ctx["results"]]
+        self._finish_export()
+
+    def _finish_export(self) -> None:
+        ctx = self._export_ctx
+        results, skipped = ctx["results"], ctx["skipped"]
+        self._set_busy("")
+        text = summarize(results, skipped)
+        self.statusBar().showMessage(text.splitlines()[0], 15000)
+        failed = [r for r in results if r.status not in ("trimmed", "copied") and r.file not in skipped]
+        if failed:
+            self._set_task_notice(
+                f"Export: {len(failed)} episode{'s' if len(failed) != 1 else ''} failed (see the summary).")
+        box = QMessageBox(self)
+        box.setWindowTitle("Export finished")
+        box.setText(text)
+        out_dir = ctx["out_dir"]
+        button = box.addButton("Open output folder", QMessageBox.ActionRole)
+        button.clicked.connect(lambda: open_url(out_dir))
+        box.addButton(QMessageBox.Close)
+        box.setModal(False)
+        self.summary_dialog = box
+        self.open_output_button = button
+        box.show()
+

@@ -47,6 +47,30 @@ def raise_(exc):
     return _raiser
 
 
+@pytest.fixture
+def window_with_project(qtbot, tmp_path, monkeypatch):
+    """A MainWindow (FakePlayer, fake tools) with a 3-episode season folder open.
+
+    Teardown waits for background workers so none outlives the test.
+    """
+    from PySide6.QtCore import QThreadPool
+    from PySide6.QtWidgets import QApplication
+
+    from oped.gui import main_window
+
+    monkeypatch.setattr(main_window, "find_tools", lambda ffmpeg=None, ffprobe=None: "TOOLS")
+    season = tmp_path / "Show S1"
+    season.mkdir()
+    for n in ("E1.mkv", "E2.mkv", "E3.mkv"):
+        (season / n).write_bytes(b"")
+    w = main_window.MainWindow(player=FakePlayer())
+    qtbot.addWidget(w)
+    w.open_folder(season)
+    yield w, w.project
+    QThreadPool.globalInstance().waitForDone(10000)
+    QApplication.processEvents()
+
+
 @pytest.fixture(autouse=True)
 def _isolated_qsettings(tmp_path_factory):
     """Keep QSettings (saved ffmpeg paths) out of the user's real profile."""

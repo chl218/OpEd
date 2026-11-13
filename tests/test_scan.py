@@ -166,6 +166,18 @@ def test_propose_references_appends_unconfirmed():
     assert len({r.id for r in new}) == len(new)
 
 
+def test_reference_candidates_report_support_without_mutating():
+    from oped.scan import reference_candidates
+
+    p = project_with(["E1.mkv", "E2.mkv", "E3.mkv"])
+    fs = {"E1.mkv": ed_feats(30, 320, 1), "E2.mkv": ed_feats(50, 300, 2),
+          "E3.mkv": ed_feats(40, 330, 3)}
+    cands = reference_candidates(p, fs.__getitem__)
+    assert {r.kind for r, _ in cands} == {"OP", "ED"}
+    assert all(2 <= s <= 3 for _, s in cands) and all(not r.confirmed for r, _ in cands)
+    assert p.references == []
+
+
 def test_make_feature_source_memoises(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(scan_mod, "probe", lambda tools, path: ("info", Path(path).name))

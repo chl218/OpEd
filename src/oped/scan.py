@@ -126,10 +126,17 @@ def scan(project: Project, feats: FeatureSource,
             progress(name, (i + 1) / len(names))
 
 
+def reference_candidates(project: Project, feats: FeatureSource) -> list[tuple[Reference, int]]:
+    """Unconfirmed references found by ``discover_references``, each with its support
+    (how many episodes contain it). The project is not modified."""
+    features = {name: feats(name) for name in project.episodes}
+    return [(Reference(new_id(), c.kind, f"{c.kind}?", c.episode, c.start, c.end, confirmed=False),
+             c.support)
+            for c in discover_references(features)]
+
+
 def propose_references(project: Project, feats: FeatureSource) -> list[Reference]:
     """Append unconfirmed references found by ``discover_references``; return the new ones."""
-    features = {name: feats(name) for name in project.episodes}
-    new = [Reference(new_id(), c.kind, f"{c.kind}?", c.episode, c.start, c.end, confirmed=False)
-           for c in discover_references(features)]
+    new = [ref for ref, _support in reference_candidates(project, feats)]
     project.references.extend(new)
     return new
