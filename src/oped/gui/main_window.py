@@ -325,6 +325,10 @@ class MainWindow(QMainWindow):
         self.action_open = QAction("Open folder", self)
         self.action_scan = QAction("Scan", self)
         self.action_approve = QAction("Approve all high", self)
+        self.action_approve.setToolTip(
+            "Approve every proposed cut with high confidence, and every manual cut: the "
+            "reference's own cut and cuts added by hand (Ctrl+N), including untouched "
+            "60 s placeholders.")
         self.action_export = QAction("Export", self)
         self.action_open.triggered.connect(self._choose_folder)
         self.action_scan.triggered.connect(self.start_scan)

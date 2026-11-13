@@ -25,6 +25,8 @@ def test_approve_all_high_only_touches_high_and_manual(qtbot, window_with_projec
     p.episodes["E1.mkv"].cuts = cuts
     w.approve_all_high()
     assert [c.status for c in cuts] == ["approved", "proposed", "approved", "rejected"]
+    tip = w.action_approve.toolTip().lower()            # S7: manual cuts are included, say so
+    assert "high confidence" in tip and "by hand" in tip and "reference" in tip
 
 
 def test_fallback_prompt_reruns_with_chosen_mode(qtbot, window_with_project, monkeypatch):
