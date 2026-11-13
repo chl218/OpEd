@@ -9,11 +9,13 @@ from pathlib import Path
 import platformdirs
 
 from PySide6.QtCore import QSettings, Qt, QTimer, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
+    QApplication,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QPushButton,
     QSplitter,
@@ -23,9 +25,11 @@ from PySide6.QtWidgets import (
 )
 
 from ..discovery import Season, discover
-from ..media import Tools, ToolsMissing, find_tools, run
+from ..media import Tools, ToolsMissing, find_tools, probe, run
 from ..project import EpisodeState, Project, load_project, project_path, save_project
+from .cut_panel import CutPanel
 from .episode_list import EpisodeList
+from .player import Player
 
 AUTOSAVE_MS = 500
 TOOL_CHECK_TIMEOUT = 5.0
@@ -46,7 +50,7 @@ class MainWindow(QMainWindow):
     episode_selected = Signal(str)
     project_changed = Signal()
 
-    def __init__(self):
+    def __init__(self, player=None):
         super().__init__()
         self.setWindowTitle("OpEd")
         self.tools: Tools | None = None
@@ -55,6 +59,7 @@ class MainWindow(QMainWindow):
         self._tools_error = ""
         self._tools_refusal = ""
         self._notices: list[str] = []
+        self._episode_notice = ""
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -78,10 +83,21 @@ class MainWindow(QMainWindow):
         # Body
         self.episode_list = EpisodeList()
         self.episode_list.currentItemChanged.connect(self._on_current_changed)
-        self.cut_panel = QWidget()  # Task 12 replaces this
+        self.episode_selected.connect(self._on_episode_selected)
+        self.player = player if player is not None else Player()
+        if hasattr(self.player, "error_occurred"):
+            self.player.error_occurred.connect(self._on_player_error)
+        self.cut_panel = CutPanel(player=self.player)
+        self.cut_panel.changed.connect(self._on_cuts_changed)
+        right = QWidget()
+        right_col = QVBoxLayout(right)
+        right_col.setContentsMargins(0, 0, 0, 0)
+        if isinstance(self.player, QWidget):
+            right_col.addWidget(self.player, 2)
+        right_col.addWidget(self.cut_panel, 3)
         split = QSplitter()
         split.addWidget(self.episode_list)
-        split.addWidget(self.cut_panel)
+        split.addWidget(right)
         split.setStretchFactor(1, 1)
 
         central = QWidget()
@@ -105,6 +121,9 @@ class MainWindow(QMainWindow):
         self.action_export.triggered.connect(self._export)
         for a in (self.action_open, self.action_scan, self.action_approve, self.action_export):
             bar.addAction(a)
+
+        self._shortcuts: dict[str, object] = {}
+        self._install_shortcuts()
 
         self._try_find_tools()
         self._update_actions()
@@ -166,6 +185,8 @@ class MainWindow(QMainWindow):
         if self._tools_refusal:
             lines.append(self._tools_refusal)
         lines.extend(self._notices)
+        if self._episode_notice:
+            lines.append(self._episode_notice)
         if self.season is not None:
             lines.extend(self.season.warnings)
         self.banner.setText("\n".join(lines))
@@ -191,6 +212,8 @@ class MainWindow(QMainWindow):
             self._save_timer.stop()
             self._autosave()
         self._notices = []
+        self._episode_notice = ""
+        self.cut_panel.clear()
         path = Path(path)
         try:
             self.season = discover(path)
@@ -264,6 +287,96 @@ class MainWindow(QMainWindow):
     def _on_current_changed(self, cur, _prev) -> None:
         if cur is not None:
             self.episode_selected.emit(cur.data(Qt.UserRole))
+        else:
+            self._set_episode_notice("")
+            self.cut_panel.clear()
+
+    def _set_episode_notice(self, text: str) -> None:
+        if text != self._episode_notice:
+            self._episode_notice = text
+            self._update_banner()
+
+    def _on_episode_selected(self, name: str) -> None:
+        if self.project is None or self.season is None or name not in self.project.episodes:
+            self.cut_panel.clear()
+            return
+        path = Path(self.season.folder) / name
+        self.cut_panel.clear()  # never keep the previous episode's state
+        try:
+            self.player.load(path)
+        except Exception as e:
+            self._set_episode_notice(f"Could not load {name} into the player: {e}")
+            return
+        if self.tools is None:
+            self._set_episode_notice(f"Cannot review {name}: ffmpeg/ffprobe not available.")
+            return
+        try:
+            info = probe(self.tools, path)
+        except Exception as e:
+            self._set_episode_notice(f"Could not read {name}: {e}")
+            return
+        self._set_episode_notice("")
+        self.cut_panel.set_episode(self.project, name, info.duration, info.fps)
+
+    def _on_cuts_changed(self) -> None:
+        self.mark_dirty()
+        if self.project is not None:
+            keep = self.episode_list.currentRow()
+            self.episode_list.blockSignals(True)
+            try:
+                self.episode_list.refresh(self.project)
+                if keep >= 0:
+                    self.episode_list.setCurrentRow(keep)
+            finally:
+                self.episode_list.blockSignals(False)
+
+    def _on_player_error(self, msg: str) -> None:
+        self._set_episode_notice(msg)
+
+    # ---- shortcuts ----
+    def _install_shortcuts(self) -> None:
+        cp = self.cut_panel
+        table = {
+            "Space": cp.play_edge,
+            "A": cp.approve,
+            "X": cp.reject,
+            "Tab": cp.toggle_edge,
+            "Left": lambda: cp.nudge(-0.1),
+            "Right": lambda: cp.nudge(0.1),
+            "Shift+Left": lambda: cp.nudge(-1.0),
+            "Shift+Right": lambda: cp.nudge(1.0),
+            "Ctrl+Left": lambda: cp.nudge(-cp.frame_step()),
+            "Ctrl+Right": lambda: cp.nudge(cp.frame_step()),
+            "Up": lambda: cp.select_relative(-1),
+            "Down": lambda: cp.select_relative(1),
+            "PageUp": lambda: self._step_episode(-1),
+            "PageDown": lambda: self._step_episode(1),
+            "I": cp.set_in,
+            "O": cp.set_out,
+            "Ctrl+N": cp.add_cut,
+        }
+        self._shortcuts = table
+        for key in table:
+            sc = QShortcut(QKeySequence(key), self)
+            sc.setContext(Qt.WindowShortcut)
+            sc.activated.connect(lambda key=key: self.trigger_shortcut(key))
+
+    def trigger_shortcut(self, key: str) -> bool:
+        """Run a shortcut action unless a text field has focus. Returns whether it ran."""
+        if isinstance(QApplication.focusWidget(), QLineEdit):
+            return False
+        fn = self._shortcuts.get(key)
+        if fn is None:
+            return False
+        fn()
+        return True
+
+    def _step_episode(self, step: int) -> None:
+        n = self.episode_list.count()
+        if n == 0:
+            return
+        row = self.episode_list.currentRow()
+        self.episode_list.setCurrentRow(min(n - 1, max(0, row + step if row >= 0 else 0)))
 
     # ---- Task 13 stubs ----
     def _scan(self) -> None:

@@ -15,6 +15,29 @@ def tools():
         pytest.skip(str(e))
 
 
+class FakePlayer:
+    """Stand-in for oped.gui.player.Player (no QtMultimedia needed)."""
+
+    def __init__(self, position: float = 0.0):
+        self._pos = position
+        self.loaded = None
+        self.spans = None
+        self.seeks = []
+
+    def position(self) -> float:
+        return self._pos
+
+    def seek(self, t: float) -> None:
+        self._pos = t
+        self.seeks.append(t)
+
+    def play_spans(self, spans) -> None:
+        self.spans = list(spans)
+
+    def load(self, path) -> None:
+        self.loaded = path
+
+
 def raise_(exc):
     """Return a callable that raises exc (for monkeypatching)."""
 
