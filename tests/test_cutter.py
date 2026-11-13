@@ -4,11 +4,10 @@ from pathlib import Path
 
 import pytest
 
-import numpy as np
-
-from fixtures import RATE, dominant_freq, frame_color, make_color_video
-from oped.cutter import SmartCutError, concat_list, cut_audio, cut_video, snap_to_frames
-from oped.media import probe, run
+from fixtures import color_switch as _color_switch, dominant_freq, frame_color, make_color_video
+from fixtures import tone_switch as _tone_switch
+from oped.cutter import SmartCutError, concat_list, cut_audio, cut_video, keyframe_intervals, snap_to_frames
+from oped.media import probe
 
 COLORS = [("red", 10), ("green", 10), ("blue", 10)]   # tones 440 / 880 / 1320
 
@@ -90,34 +89,6 @@ def test_no_stray_temp_files(tools, tmp_path, monkeypatch):
     assert list(work.iterdir()) == []
 
 
-def _color_switch(tools, path, lo, hi, channel):
-    """Time (to ~0.25 ms) at which ``channel`` first dominates the frame on screen."""
-    for _ in range(12):
-        mid = (lo + hi) / 2
-        if frame_color(tools, path, mid)[channel] > 200:
-            hi = mid
-        else:
-            lo = mid
-    return hi
-
-
-def _tone_switch(tools, path, lo, hi, f_old, f_new, stream=0):
-    """Time at which tone ``f_new`` overtakes ``f_old`` (4 ms windows, samples placed by pts)."""
-    out = run([
-        tools.ffmpeg, "-v", "error", "-nostdin", "-i", str(path), "-map", f"0:a:{stream}",
-        "-af", f"aresample=async=1:min_hard_comp=0.001:first_pts=0,atrim=start={lo}:end={hi}",
-        "-ac", "1", "-ar", str(RATE), "-f", "s16le", "-",
-    ]).stdout
-    x = np.frombuffer(out, dtype="<i2").astype(np.float64)
-    n = int(0.004 * RATE)
-    tt = np.arange(n) / RATE
-    for i in range(0, len(x) - n, n // 4):
-        seg = x[i:i + n]
-        if abs(seg @ np.exp(-2j * np.pi * f_new * tt)) > abs(seg @ np.exp(-2j * np.pi * f_old * tt)):
-            return lo + (i + n / 2) / RATE
-    raise AssertionError("no tone switch found")
-
-
 def test_snap_to_frames_uses_the_video_frame_grid(tools, tmp_path):
     src = make_color_video(tools, tmp_path / "g.mkv", COLORS)          # 24 fps, ms timestamps
     snapped = snap_to_frames(tools, probe(tools, src), [(0, 5.01), (15.03, 30), (29.99, 29.995)])
@@ -150,3 +121,26 @@ def test_smart_cut_source_without_bframes(tools, tmp_path, vcodec, ext):
     assert abs(probe(tools, v).duration - 20) < 0.1
     assert frame_color(tools, v, 4.9)[0] > 200
     assert frame_color(tools, v, 5.06)[1] > 100
+
+
+def test_keyframe_intervals_are_what_keyframe_mode_keeps(tools, tmp_path):
+    src = make_color_video(tools, tmp_path / "k.mkv", COLORS)           # keyframes every 2 s
+    info = probe(tools, src)
+    keep = [(0, 5), (15.5, 30)]
+    kf = keyframe_intervals(tools, info, keep)
+    assert kf == [pytest.approx((0, 4), abs=0.001), pytest.approx((16, info.duration), abs=0.001)]
+    v = cut_video(tools, info, keep, tmp_path / "v.mkv", "keyframe", tmp_path)
+    a = cut_audio(tools, info, kf, tmp_path / "a.mka", tmp_path)
+    assert abs(probe(tools, v).duration - sum(e - s for s, e in kf)) < 0.1
+    # Source green->blue at 20 s lands at 4 + 4 = 8 s in both video and audio.
+    video_t = _color_switch(tools, v, 7.5, 8.5, channel=2)
+    audio_t = _tone_switch(tools, a, 7.5, 8.5, 880, 1320)
+    assert abs(video_t - 8.0) < 0.05 and abs(audio_t - video_t) < 0.03
+
+
+def test_keyframe_intervals_merge_overlapping_snaps(tools, tmp_path):
+    src = make_color_video(tools, tmp_path / "k2.mkv", COLORS)
+    info = probe(tools, src)
+    # (6.1, 6.3) snaps to 6..8 and (6.5, 30) starts at 6 again: 6..8 must not be kept twice.
+    kf = keyframe_intervals(tools, info, [(0, 5.5), (6.1, 6.3), (6.5, 30)])
+    assert kf == [pytest.approx((0, info.duration), abs=0.001)]

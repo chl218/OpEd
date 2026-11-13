@@ -154,6 +154,7 @@ def make_color_video(
 ) -> Path:
     """Segment i is a solid colour with a sine tone of 440*(i+1) Hz (all audio tracks identical)."""
     path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     ext = path.suffix.lower()
     total = sum(d for _, d in colors)
     tmp = Path(tempfile.mkdtemp(prefix="oped_fx_"))  # ASCII-safe helper files
@@ -198,7 +199,8 @@ def make_color_video(
             cmd += ["-i", str(meta)]
             meta_idx = n_in + extra
         if font:
-            cmd += ["-attach", str(font), "-metadata:s:t", "mimetype=font/ttf"]
+            cmd += ["-attach", str(font), "-metadata:s:t", "mimetype=font/ttf",
+                    "-metadata:s:t", f"filename={Path(font).name}"]
 
         cmd += maps
         cmd += ["-c:v", vcodec, *vopts, "-pix_fmt", "yuv420p", "-g", str(gop),
@@ -260,3 +262,39 @@ def extract_sub_events(tools: Tools, path: Path, stream: int = 0) -> list[tuple[
         start = float(p["pts_time"])
         ev.append((start, start + float(p.get("duration_time", 0) or 0)))
     return ev
+
+
+def raise_(exc: BaseException):
+    """A stand-in callable that raises ``exc`` whatever it is called with (for monkeypatching)."""
+    def _raise(*args, **kwargs):
+        raise exc
+    return _raise
+
+
+def color_switch(tools: Tools, path: Path, lo: float, hi: float, channel: int) -> float:
+    """Time (to ~0.25 ms) at which ``channel`` first dominates the frame on screen."""
+    for _ in range(12):
+        mid = (lo + hi) / 2
+        if frame_color(tools, path, mid)[channel] > 200:
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
+def tone_switch(tools: Tools, path: Path, lo: float, hi: float, f_old: float, f_new: float,
+                stream: int = 0) -> float:
+    """Time at which tone ``f_new`` overtakes ``f_old`` (4 ms windows, samples placed by pts)."""
+    out = run([
+        tools.ffmpeg, "-v", "error", "-nostdin", "-i", str(path), "-map", f"0:a:{stream}",
+        "-af", f"aresample=async=1:min_hard_comp=0.001:first_pts=0,atrim=start={lo}:end={hi}",
+        "-ac", "1", "-ar", str(RATE), "-f", "s16le", "-",
+    ]).stdout
+    x = np.frombuffer(out, dtype="<i2").astype(np.float64)
+    n = int(0.004 * RATE)
+    tt = np.arange(n) / RATE
+    for i in range(0, len(x) - n, n // 4):
+        seg = x[i:i + n]
+        if abs(seg @ np.exp(-2j * np.pi * f_new * tt)) > abs(seg @ np.exp(-2j * np.pi * f_old * tt)):
+            return lo + (i + n / 2) / RATE
+    raise AssertionError("no tone switch found")

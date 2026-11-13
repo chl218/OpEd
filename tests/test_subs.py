@@ -79,3 +79,23 @@ def test_chapters_escape_and_empty(tmp_path):
     assert "title=a" + BS + "=b" + BS + ";c" + BS + "#d" + BS + BS + "e" + BS + chr(10) + "f" in meta
     assert write_ffmetadata((Chapter(12, 15, "x"),), TM(), tmp_path / "d.txt") is None
     assert write_ffmetadata((), TM(), tmp_path / "e.txt") is None
+
+
+def test_chapter_at_cut_start_does_not_become_zero_length(tmp_path):
+    # "OP" starts exactly where the cut starts: it maps to 10, as does "B" at 20.
+    ch = (Chapter(0, 10, "A"), Chapter(10, 20, "OP"), Chapter(20, 30, "B"))
+    meta = write_ffmetadata(ch, TM(), tmp_path / "z.txt").read_text()
+    assert "title=OP" not in meta and "title=A" in meta and "title=B" in meta
+    assert meta.count("[CHAPTER]") == 2 and "START=10000" in meta
+    # A chapter starting at the very end of the output is zero-length too.
+    end = write_ffmetadata((Chapter(0, 25, "A"), Chapter(25, 30, "Z")), TimeMap([(25, 30)], 30),
+                           tmp_path / "e2.txt").read_text()
+    assert "title=Z" not in end and "END=25000" in end
+
+
+def test_all_cues_cut_writes_nothing(tools, tmp_path):
+    # A packet-less, subtitle-only mkv is unreadable, so nothing is written (export then
+    # keeps the empty streams by mapping them from the source with all packets dropped).
+    src = make_color_video(tools, tmp_path / "e.mkv", [("red", 30)], ass_lines=[(12, 14, "x")], image_sub=True)
+    assert retime_embedded_subs(probe(tools, src), TM(), tmp_path / "subs.mkv") is None
+    assert not (tmp_path / "subs.mkv").exists()

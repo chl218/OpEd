@@ -313,19 +313,54 @@ def _reencode(tools: Tools, info: MediaInfo, keep: list[Interval], out: Path) ->
     ])
 
 
-def _keyframe(tools: Tools, info: MediaInfo, keep: list[Interval], work: Path, out: Path) -> None:
-    """Snap each interval to the nearest keyframes and stream-copy whole GOPs."""
+def _keyframe_plan(tools: Tools, info: MediaInfo,
+                   keep: list[Interval]) -> list[tuple[_Packet, _Packet | None]]:
+    """Snap each (frame-snapped) interval to the nearest keyframes.
+
+    Returns ``(start keyframe, end keyframe or None for end of file)`` pairs, merged so
+    no GOP is kept twice when neighbouring intervals snap onto the same keyframes.
+    """
     _first_video(info)
     pkts = _video_packets(tools, info.path)
     keys = [p for p in pkts if p.key]
     if not keys:
         raise FfmpegError([tools.ffprobe], "no keyframes found")
-    entries = []
+    plan: list[tuple[_Packet, _Packet | None]] = []
     for a, b in keep:
         start = min(keys, key=lambda p: abs(p.pts - a))
         later = [p for p in keys if p.pts > start.pts]
         end = min(later, key=lambda p: abs(p.pts - b)) if later else None
-        if end is None or abs(b - info.duration) < abs(b - end.pts):
+        if end is not None and abs(b - info.duration) < abs(b - end.pts):
+            end = None
+        if plan:
+            prev_start, prev_end = plan[-1]
+            if prev_end is None:
+                break
+            if start.pts <= prev_end.pts + _EPS:
+                if end is not None and end.pts <= prev_end.pts + _EPS:
+                    continue
+                plan[-1] = (prev_start, end)
+                continue
+        plan.append((start, end))
+    return plan
+
+
+def keyframe_intervals(tools: Tools, info: MediaInfo, keep: list[Interval]) -> list[Interval]:
+    """KEEP intervals as keyframe mode actually keeps them (source seconds).
+
+    ``keep`` is first snapped to the frame grid, exactly as ``cut_video`` does. In
+    keyframe mode audio (``cut_audio``), subtitles and chapters must use these
+    intervals, or they drift from the video by up to a GOP per cut.
+    """
+    plan = _keyframe_plan(tools, info, snap_to_frames(tools, info, keep))
+    return [(s.pts, e.pts if e is not None else info.duration) for s, e in plan]
+
+
+def _keyframe(tools: Tools, info: MediaInfo, keep: list[Interval], work: Path, out: Path) -> None:
+    """Snap each interval to the nearest keyframes and stream-copy whole GOPs."""
+    entries = []
+    for start, end in _keyframe_plan(tools, info, keep):
+        if end is None:
             entries.append((info.path, start.pts + _NUDGE, None, max(info.duration - start.pts, 0.0)))
         else:
             entries.append((info.path, start.pts + _NUDGE, end.dts - _EPS, end.pts - start.pts))

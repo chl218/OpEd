@@ -17,7 +17,7 @@ def _retime_packets(src: Path, out: Path, tm: TimeMap, indices: list[int] | None
     """Demux subtitle streams of ``src`` (PyAV stream indices), retime, mux into ``out``.
 
     ``text_streams`` holds the indices to treat as text; all others are image streams.
-    Returns False when there was nothing to write.
+    Returns False (and writes nothing) when no stream or no packet survives.
     """
     out.parent.mkdir(parents=True, exist_ok=True)
     with av.open(str(src)) as inp:
@@ -45,6 +45,11 @@ def _retime_packets(src: Path, out: Path, tm: TimeMap, indices: list[int] | None
             if span is None:
                 continue
             items.append((span[0], n, idx, pkt, span[1] - span[0], tb))
+        if not items:
+            # Every cue was cut. A matroska file holding only packet-less subtitle
+            # streams comes out unreadable, so write nothing; callers keep the empty
+            # streams some other way (export maps them from the source, packets dropped).
+            return False
         items.sort(key=lambda x: (x[0], x[1]))
         with av.open(str(out), "w") as outc:
             omap = {i: outc.add_stream_from_template(s) for i, s in by_index.items()}
@@ -58,6 +63,7 @@ def _retime_packets(src: Path, out: Path, tm: TimeMap, indices: list[int] | None
 
 
 def retime_embedded_subs(info: MediaInfo, tm: TimeMap, out: Path) -> Path | None:
+    """Retime all subtitle streams into ``out``; None if there are none or every cue was cut."""
     if not info.subtitles():
         return None
     out = Path(out)
@@ -99,6 +105,10 @@ def write_ffmetadata(chapters: tuple[Chapter, ...], tm: TimeMap, path: Path) -> 
         t = tm.map(c.start)
         if t is not None:
             starts.append((t, c.title))
+    # A chapter whose mapped start equals the next one's (it began exactly where a cut
+    # began) or the output end would be zero-length: keep only the later chapter.
+    ends = [round(t * 1000) for t, _ in starts[1:]] + [round(tm.out_duration * 1000)]
+    starts = [s for s, nxt in zip(starts, ends) if round(s[0] * 1000) < nxt]
     if not starts:
         return None
     lines = [";FFMETADATA1"]
