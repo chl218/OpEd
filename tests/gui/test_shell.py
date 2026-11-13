@@ -81,6 +81,7 @@ def test_choose_ffmpeg_retries_and_enables(qtbot, monkeypatch, tmp_path):
         return "TOOLS"
 
     monkeypatch.setattr(main_window, "find_tools", fake)
+    monkeypatch.setattr(main_window, "_tool_works", lambda p: True)
     w = MainWindow()
     qtbot.addWidget(w)
     assert not w.action_scan.isEnabled()
@@ -93,3 +94,81 @@ def test_choose_ffmpeg_retries_and_enables(qtbot, monkeypatch, tmp_path):
     w2 = MainWindow()
     qtbot.addWidget(w2)
     assert w2.tools == "TOOLS"  # stored paths reused
+
+
+import pytest
+
+
+@pytest.mark.parametrize("content", ["{not json", "[1, 2]", '{"episodes": 5}'])
+def test_corrupt_project_backed_up_outside_season_folder(qtbot, tmp_path, monkeypatch, content):
+    data = tmp_path / "data"
+    monkeypatch.setattr(main_window.platformdirs, "user_data_dir", lambda *a, **k: str(data))
+    season = tmp_path / "season"
+    season.mkdir()
+    (season / "E1.mkv").write_bytes(b"")
+    (season / "oped-project.json").write_text(content, encoding="utf-8")
+    w = MainWindow()
+    qtbot.addWidget(w)
+    w.open_folder(season)
+    assert sorted(p.name for p in season.iterdir()) == ["E1.mkv", "oped-project.json"]
+    backups = list((data / "backups").glob("*.json"))
+    assert len(backups) == 1 and backups[0].read_text(encoding="utf-8") == content
+    assert str(backups[0]) in w.banner.text()
+    assert w.episode_list.count() == 1
+
+
+def test_corrupt_project_backup_failure_is_reported(qtbot, tmp_path, monkeypatch):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x")  # a file where a directory is needed
+    monkeypatch.setattr(main_window.platformdirs, "user_data_dir", lambda *a, **k: str(blocker))
+    season = tmp_path / "season"
+    season.mkdir()
+    (season / "E1.mkv").write_bytes(b"")
+    (season / "oped-project.json").write_text("{bad", encoding="utf-8")
+    w = MainWindow()
+    qtbot.addWidget(w)
+    w.open_folder(season)
+    assert "failed" in w.banner.text() and "backed up to" not in w.banner.text()
+    assert sorted(p.name for p in season.iterdir()) == ["E1.mkv", "oped-project.json"]
+
+
+def test_pending_edit_flushed_on_folder_switch(qtbot, tmp_path):
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    (a / "E1.mkv").write_bytes(b"")
+    (b / "E1.mkv").write_bytes(b"")
+    w = MainWindow()
+    qtbot.addWidget(w)
+    w.open_folder(a)
+    w.project.episodes["E1.mkv"].flags.append("pending")
+    w.mark_dirty()
+    w.open_folder(b)
+    saved = json.loads((a / "oped-project.json").read_text(encoding="utf-8"))
+    assert saved["episodes"]["E1.mkv"]["flags"] == ["pending"]
+
+
+def test_invalid_tool_paths_not_saved_and_fall_back_to_path(qtbot, monkeypatch, tmp_path):
+    from PySide6.QtCore import QSettings
+
+    seen = []
+
+    def fake(ffmpeg=None, ffprobe=None):
+        seen.append((ffmpeg, ffprobe))
+        return "PATH_TOOLS"
+
+    monkeypatch.setattr(main_window, "find_tools", fake)
+    bogus = tmp_path / "nothing"
+    w = MainWindow()
+    qtbot.addWidget(w)
+    w.set_tool_paths(str(bogus), str(bogus))
+    assert QSettings("oped", "oped").value("ffmpeg_path") is None
+    assert w.tools == "PATH_TOOLS"
+    s = QSettings("oped", "oped")
+    s.setValue("ffmpeg_path", str(bogus))
+    s.setValue("ffprobe_path", str(bogus))
+    seen.clear()
+    w2 = MainWindow()
+    qtbot.addWidget(w2)
+    assert seen == [(None, None)]

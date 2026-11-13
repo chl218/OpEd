@@ -1,8 +1,12 @@
 """Main window: folder open, episode list, banner, autosave."""
 from __future__ import annotations
 
-import os
+import hashlib
+import shutil
+import time
 from pathlib import Path
+
+import platformdirs
 
 from PySide6.QtCore import QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QAction
@@ -19,11 +23,22 @@ from PySide6.QtWidgets import (
 )
 
 from ..discovery import Season, discover
-from ..media import Tools, ToolsMissing, find_tools
+from ..media import Tools, ToolsMissing, find_tools, run
 from ..project import EpisodeState, Project, load_project, project_path, save_project
 from .episode_list import EpisodeList
 
 AUTOSAVE_MS = 500
+
+
+def _tool_works(path: str) -> bool:
+    """True if `path` exists and answers `-version`."""
+    try:
+        if not Path(path).is_file():
+            return False
+        run([path, "-version"])
+        return True
+    except Exception:
+        return False
 
 
 class MainWindow(QMainWindow):
@@ -95,10 +110,14 @@ class MainWindow(QMainWindow):
 
     # ---- tools ----
     def _try_find_tools(self, ffmpeg: str | None = None, ffprobe: str | None = None) -> None:
+        """Use the given (or stored) paths if they work, else search PATH."""
         if ffmpeg is None and ffprobe is None:
             s = QSettings("oped", "oped")
             ffmpeg = s.value("ffmpeg_path", None) or None
             ffprobe = s.value("ffprobe_path", None) or None
+        if ffmpeg or ffprobe:
+            if not (ffmpeg and ffprobe and _tool_works(ffmpeg) and _tool_works(ffprobe)):
+                ffmpeg = ffprobe = None
         try:
             self.tools = find_tools(ffmpeg, ffprobe)
             self._tools_error = ""
@@ -110,6 +129,16 @@ class MainWindow(QMainWindow):
             self._tools_error = f"Could not use ffmpeg: {e}"
 
     def set_tool_paths(self, ffmpeg: str, ffprobe: str) -> None:
+        if not (_tool_works(ffmpeg) and _tool_works(ffprobe)):
+            self._try_find_tools(None, None)
+            if self.tools is None:
+                self._tools_error = (
+                    f"The selected files did not run as ffmpeg/ffprobe (-version failed): "
+                    f"{ffmpeg}, {ffprobe}. " + self._tools_error
+                )
+            self._update_actions()
+            self._update_banner()
+            return
         s = QSettings("oped", "oped")
         s.setValue("ffmpeg_path", ffmpeg)
         s.setValue("ffprobe_path", ffprobe)
@@ -154,7 +183,9 @@ class MainWindow(QMainWindow):
             self.open_folder(Path(d))
 
     def open_folder(self, path: Path) -> None:
-        self._save_timer.stop()
+        if self._save_timer.isActive():
+            self._save_timer.stop()
+            self._autosave()
         self._notices = []
         path = Path(path)
         try:
@@ -171,11 +202,11 @@ class MainWindow(QMainWindow):
             self._notices.append(f"No video files found in {path}.")
         try:
             self.project = load_project(self.season)
-        except (ValueError, TypeError, KeyError, OSError) as e:
-            self.project = self._recover_corrupt_project()
+        except (ValueError, TypeError, KeyError, AttributeError, OSError) as e:
+            self.project = self._fresh_project()
             self._notices.append(
-                f"The saved project file was unreadable ({type(e).__name__}) and was set "
-                "aside with a .corrupt suffix; starting a fresh project."
+                f"The saved project file was unreadable ({type(e).__name__}); "
+                f"starting a fresh project. {self._backup_corrupt_project()}"
             )
         self.episode_list.set_sidecars(
             {ep.video.name: [s.name for s in ep.sidecars] for ep in self.season.episodes}
@@ -186,17 +217,26 @@ class MainWindow(QMainWindow):
         self._update_banner()
         self.project_changed.emit()
 
-    def _recover_corrupt_project(self) -> Project:
+    def _fresh_project(self) -> Project:
         assert self.season is not None
-        try:
-            p = project_path(self.season.folder)
-            os.replace(p, p.with_name(p.name + ".corrupt"))
-        except OSError:
-            pass
         project = Project(Path(self.season.folder), [], {})
         for ep in self.season.episodes:
             project.episodes[ep.video.name] = EpisodeState(file=ep.video.name)
         return project
+
+    def _backup_corrupt_project(self) -> str:
+        """Copy the unreadable project file outside the season folder; report the real outcome."""
+        assert self.season is not None
+        try:
+            src = project_path(self.season.folder)
+            digest = hashlib.sha1(str(Path(self.season.folder).resolve()).encode("utf-8")).hexdigest()
+            dest_dir = Path(platformdirs.user_data_dir("oped")) / "backups"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / f"{digest}-{time.strftime('%Y%m%d-%H%M%S')}.json"
+            shutil.copy2(src, dest)
+            return f"The old file was backed up to {dest}."
+        except OSError as e:
+            return f"Backing up the old file failed ({e}); it will be overwritten on the next save."
 
     def mark_dirty(self) -> None:
         self._save_timer.start()

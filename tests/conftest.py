@@ -38,4 +38,6 @@ def _isolated_qsettings(tmp_path_factory):
         str(tmp_path_factory.mktemp("qsettings")),
     )
     QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings("oped", "oped").clear()
     yield
+    QSettings("oped", "oped").clear()
