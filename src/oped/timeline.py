@@ -24,8 +24,8 @@ def merge_cuts(cuts: list[Interval], duration: float) -> list[Interval]:
     return merged
 
 
-def _complement(merged: list[Interval], lo: float, hi: float) -> list[Interval]:
-    """Pieces of [lo, hi] outside the (merged) cuts; never zero-length."""
+def complement(merged: list[Interval], lo: float, hi: float) -> list[Interval]:
+    """Pieces of [lo, hi] outside the (merged, sorted) intervals; never zero-length."""
     out: list[Interval] = []
     pos = lo
     for s, e in merged:
@@ -43,7 +43,7 @@ def _complement(merged: list[Interval], lo: float, hi: float) -> list[Interval]:
 
 def keep_intervals(cuts: list[Interval], duration: float) -> list[Interval]:
     merged = merge_cuts(cuts, duration)
-    return [(s, e) for s, e in _complement(merged, 0.0, float(duration)) if e - s >= MIN_KEEP]
+    return [(s, e) for s, e in complement(merged, 0.0, float(duration)) if e - s >= MIN_KEEP]
 
 
 class TimeMap:
@@ -70,7 +70,7 @@ class TimeMap:
         return t - self._removed(t)
 
     def map_span(self, a: float, b: float) -> Interval | None:
-        pieces = _complement(self.cuts, a, b) if b > a else []
+        pieces = complement(self.cuts, a, b) if b > a else []
         if not pieces:
             return None
         return (self.snap(pieces[0][0]), self.snap(pieces[-1][1]))
@@ -78,7 +78,7 @@ class TimeMap:
     def map_span_whole(self, a: float, b: float) -> Interval | None:
         if b <= a:
             return None
-        pieces = _complement(self.cuts, a, b)
+        pieces = complement(self.cuts, a, b)
         kept = sum(e - s for s, e in pieces)
         if not pieces or kept / (b - a) < 0.5 - 1e-9:
             return None

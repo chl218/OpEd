@@ -74,3 +74,10 @@ def test_map_span_whole_snaps_and_clamps():
     tm2 = TimeMap([(90, 100)], 100)
     assert tm2.map_span_whole(80, 95) is None or tm2.map_span_whole(80, 95)[1] <= tm2.out_duration
     assert TimeMap([(0, 100)], 100).map_span_whole(10, 20) is None
+
+
+def test_complement_is_public():
+    from oped.timeline import complement
+
+    assert complement([(1, 2), (5, 6)], 0, 8) == [(0, 1), (2, 5), (6, 8)]
+    assert complement([(0, 8)], 0, 8) == []

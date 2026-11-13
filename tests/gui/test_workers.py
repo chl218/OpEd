@@ -482,3 +482,31 @@ def test_rescan_keeps_decisions_edits_and_a_deleted_reference_stays_deleted(qtbo
     w.approve_all_high()
     assert all(not (319 < c.start < 321) for st in p.episodes.values() for c in st.cuts
                if c.status == "approved")
+
+
+def test_export_from_a_drive_root_is_explained_in_the_banner(qtbot, window_with_project, monkeypatch):
+    """S9: output_folder() has no sibling for a drive root; the slot must not traceback."""
+    w, p = window_with_project
+    w.season.folder = Path(Path.cwd().anchor)
+    monkeypatch.setattr(main_window, "confirm_export", lambda parent, names: list(names))
+    monkeypatch.setattr(main_window, "export_season", raise_(AssertionError("exported")))
+    w.start_export()
+    assert "drive root" in w.banner.text()
+    assert idle(w) and w.summary_dialog is None
+
+
+def test_reexport_worker_failure_still_shows_the_summary(qtbot, window_with_project, monkeypatch):
+    """S8: the first-pass results are summarized even when the fallback re-run dies."""
+    w, p = window_with_project
+    monkeypatch.setattr(main_window, "confirm_export", lambda parent, names: list(names))
+    monkeypatch.setattr(main_window, "export_season", lambda *a, **k: [
+        EpisodeResult("E1.mkv", "trimmed", "smart"),
+        EpisodeResult("E2.mkv", "needs_fallback", "smart", "no keyframe")])
+    monkeypatch.setattr(main_window, "ask_fallback", lambda parent, f, msg: "reencode")
+    monkeypatch.setattr(main_window, "export_episode", raise_(MemoryError("out of memory")))
+    w.start_export()
+    qtbot.waitUntil(lambda: w.summary_dialog is not None, timeout=5000)
+    text = w.summary_dialog.text()
+    assert "1 trimmed" in text and "1 failed" in text
+    assert "E2.mkv" in text and "out of memory" in text
+    assert idle(w)

@@ -36,7 +36,8 @@ from PySide6.QtWidgets import (
 )
 
 from ..discovery import Season, discover
-from ..export import EpisodeResult, existing_outputs, export_episode, export_season, output_folder
+from ..export import (EpisodeResult, OutputFolderError, existing_outputs, export_episode,
+                      export_season, output_folder)
 from ..fingerprint import default_cache_dir
 from ..media import Tools, ToolsMissing, find_tools, probe, run
 from ..project import (EpisodeState, Project, Reference, confidence_level, load_project,
@@ -657,11 +658,11 @@ class MainWindow(QMainWindow):
         self._task_notice = text
         self._update_banner()
 
-    def _start_worker(self, fn, on_finished, failure_prefix: str) -> None:
+    def _start_worker(self, fn, on_finished, failure_prefix: str, on_failed=None) -> None:
         worker = Worker(fn, self._cancel)
         worker.signals.progress.connect(self._on_worker_progress)
         worker.signals.finished.connect(on_finished)
-        worker.signals.failed.connect(self._on_worker_failed)
+        worker.signals.failed.connect(on_failed or self._on_worker_failed)
         self._failure_prefix = failure_prefix
         self._worker = worker  # keep it alive until its signals have been delivered
         worker.start()
@@ -806,6 +807,11 @@ class MainWindow(QMainWindow):
     def start_export(self) -> None:
         if not self._ready():
             return
+        try:
+            out_dir = output_folder(self.season.folder)
+        except OutputFolderError as e:
+            self._set_task_notice(str(e))
+            return
         names = [ep.video.name for ep in self.season.episodes if ep.video.name in self.project.episodes]
         files = confirm_export(self, names)
         if not files:
@@ -814,7 +820,6 @@ class MainWindow(QMainWindow):
                          if c.status == "proposed")
         if unreviewed and not confirm_unreviewed(self, unreviewed):
             return
-        out_dir = output_folder(self.season.folder)
         existing = existing_outputs(self.season, files)
         if existing and not confirm_overwrite(self, [str(p.relative_to(out_dir)) for p in existing]):
             return
@@ -849,8 +854,10 @@ class MainWindow(QMainWindow):
         tools, season, snapshot, out_dir = ctx["tools"], ctx["season"], ctx["project"], ctx["out_dir"]
         by_name = {ep.video.name: ep for ep in season.episodes}
 
+        # Filled as episodes finish, so a worker failure keeps the results already made.
+        out: dict[str, EpisodeResult] = {}
+
         def work(progress):
-            out: dict[str, EpisodeResult] = {}
             for f, mode in reruns.items():
                 ep = by_name.get(f)
                 if ep is None:
@@ -861,14 +868,26 @@ class MainWindow(QMainWindow):
                                         progress=lambda x, f=f: progress(f, x))
             return out
 
+        ctx["reruns"], ctx["rerun_results"] = dict(reruns), out
         self._set_busy("Re-exporting")
-        self._start_worker(work, self._on_reexported, "Export failed")
+        self._start_worker(work, self._on_reexported, "Export failed", self._on_reexport_failed)
 
     def _on_reexported(self, out) -> None:
         if self._closed:  # quit while running: no dialogs, no widget updates
             return
         ctx = self._export_ctx
         ctx["results"] = [out.get(r.file, r) for r in ctx["results"]]
+        self._finish_export()
+
+    def _on_reexport_failed(self, msg: str) -> None:
+        """The fallback re-run died: still summarize, with its episodes marked failed."""
+        if self._closed:  # quit while running: no dialogs, no widget updates
+            return
+        ctx = self._export_ctx
+        reruns, done = ctx.get("reruns", {}), ctx.get("rerun_results", {})
+        ctx["results"] = [
+            done.get(r.file) or EpisodeResult(r.file, "failed", reruns[r.file], f"re-export failed: {msg}")
+            if r.file in reruns else r for r in ctx["results"]]
         self._finish_export()
 
     def _finish_export(self) -> None:

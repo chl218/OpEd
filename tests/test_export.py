@@ -1,10 +1,11 @@
+import os
 from pathlib import Path
 
 import pysubs2
 import pytest
 
 import oped.export as export
-from fixtures import color_switch, make_color_video, raise_, tone_switch, write_ass
+from fixtures import color_switch, extract_sub_events, make_color_video, raise_, tone_switch, write_ass
 from oped.cutter import SmartCutError
 from oped.discovery import discover
 from oped.export import EpisodeResult, existing_outputs, export_episode, export_season, output_folder
@@ -41,6 +42,10 @@ def test_export_episode_keeps_everything(tools, tmp_path):
     side = pysubs2.load(str(out_dir / "E1.en.ass"))
     assert side[0].start == 15000
     assert not list(out_dir.glob("*.part"))
+    # Embedded cues in the FINAL file (text and image streams) follow the cut video.
+    for stream in (0, 1):
+        events = extract_sub_events(tools, out_dir / "E1.mkv", stream=stream)
+        assert [(round(a, 2), round(b, 2)) for a, b in events] == [(1, 3), (15, 17)], (stream, events)
 
 
 def test_cut_at_file_edges(tools, tmp_path):
@@ -306,3 +311,55 @@ def test_recap_episode_sidecar_is_retimed_with_its_own_cuts(tools, tmp_path):
     assert [r.status for r in res] == ["trimmed", "trimmed"], [r.message for r in res]
     ev = pysubs2.load(str(output_folder(season_dir) / "[G] Show - 01.5.ass"))[0]
     assert (ev.start, ev.end) == (1000, 2000)
+
+
+def _old_outputs(season_dir):
+    out_dir = output_folder(season_dir)
+    out_dir.mkdir()
+    (out_dir / "E1.mkv").write_bytes(b"old video")
+    (out_dir / "E1.en.ass").write_bytes(b"old subs")
+    return out_dir
+
+
+def _replace_failing_on(monkeypatch, name):
+    real = os.replace
+
+    def replace(src, dst):
+        if Path(dst).name == name:
+            raise PermissionError(13, "The process cannot access the file (open in a player)", str(dst))
+        return real(src, dst)
+
+    monkeypatch.setattr(export.os, "replace", replace)
+
+
+def test_video_is_replaced_before_sidecars(tools, tmp_path, monkeypatch):
+    """S5: if the old output video is locked, the sidecars must not already be new."""
+    season_dir, season = build(tools, tmp_path)
+    out_dir = _old_outputs(season_dir)
+    _replace_failing_on(monkeypatch, "E1.mkv")
+    r = export_episode(tools, season.episodes[0], season_dir, [(10, 20)], out_dir)
+    assert r.status == "failed" and "open in a player" in r.message
+    assert "already updated" not in r.message
+    assert (out_dir / "E1.mkv").read_bytes() == b"old video"
+    assert (out_dir / "E1.en.ass").read_bytes() == b"old subs"
+    assert sorted(p.name for p in out_dir.iterdir()) == ["E1.en.ass", "E1.mkv"]
+
+
+def test_failed_sidecar_replace_names_the_updated_files(tools, tmp_path, monkeypatch):
+    season_dir, season = build(tools, tmp_path)
+    out_dir = _old_outputs(season_dir)
+    _replace_failing_on(monkeypatch, "E1.en.ass")
+    r = export_episode(tools, season.episodes[0], season_dir, [(10, 20)], out_dir)
+    assert r.status == "failed"
+    assert "already updated: E1.mkv" in r.message and "E1.en.ass" in r.message
+    assert abs(probe(tools, out_dir / "E1.mkv").duration - 20) < 0.1
+    assert (out_dir / "E1.en.ass").read_bytes() == b"old subs"
+    assert sorted(p.name for p in out_dir.iterdir()) == ["E1.en.ass", "E1.mkv"]
+
+
+def test_drive_root_has_no_sibling_output_folder():
+    """S9: Path("E:/").with_name(...) raises a bare ValueError; say what is wrong instead."""
+    root = Path(Path.cwd().anchor)
+    with pytest.raises(export.OutputFolderError, match="drive root"):
+        output_folder(root)
+    assert issubclass(export.OutputFolderError, ValueError)

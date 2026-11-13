@@ -22,7 +22,7 @@ from .discovery import EpisodeFiles, Season
 from .media import FfmpegError, MediaInfo, StreamInfo, Tools, probe, run
 from .project import Project
 from .subs import retime_embedded_subs, retime_sidecar, write_ffmetadata
-from .timeline import Interval, TimeMap, _complement, keep_intervals, merge_cuts
+from .timeline import Interval, TimeMap, complement, keep_intervals, merge_cuts
 
 Status = Literal["trimmed", "copied", "failed", "needs_fallback"]
 
@@ -45,8 +45,17 @@ class EpisodeResult:
     message: str = ""
 
 
+class OutputFolderError(ValueError):
+    """The season folder has no place for a sibling ``<name> (trimmed)`` folder."""
+
+
 def output_folder(season_folder: Path) -> Path:
     season_folder = Path(season_folder)
+    if not season_folder.name:
+        raise OutputFolderError(
+            f"Cannot export from a drive root ({season_folder}): the trimmed copies go to a "
+            "sibling folder '<season folder> (trimmed)', and a drive root has none. Move the "
+            "episodes into a folder and open that folder.")
     return season_folder.with_name(season_folder.name + " (trimmed)")
 
 
@@ -119,7 +128,15 @@ def _time_map(info: MediaInfo, keep: list[Interval]) -> TimeMap:
     snapping, and any head or tail, so subtitles and chapters follow the cut video.
     """
     duration = max(info.duration, keep[-1][1])
-    return TimeMap(_complement(keep, 0.0, duration), duration)
+    return TimeMap(complement(keep, 0.0, duration), duration)
+
+
+def _partial(e: OSError, done: list[str]) -> str:
+    """Message for a failure while moving outputs onto their final names."""
+    if not done:
+        return str(e)
+    return (f"{e} (already updated: {', '.join(done)}; the other files of this episode "
+            "still hold the previous export, if any)")
 
 
 def _sidecar_error(path: Path, e: Exception) -> str:
@@ -141,9 +158,14 @@ def export_episode(tools: Tools, ep: EpisodeFiles, season_folder: Path, cuts: li
     final = _out_path(ep.video, season_folder, out_dir)
     try:
         if not cuts:
-            _copy_atomic(ep.video, final)
-            for side in ep.sidecars:
-                _copy_atomic(side, _out_path(side, season_folder, out_dir))
+            done: list[str] = []
+            try:
+                for src in [ep.video, *ep.sidecars]:   # the video first, as when trimming
+                    dst = _out_path(src, season_folder, out_dir)
+                    _copy_atomic(src, dst)
+                    done.append(dst.relative_to(out_dir).as_posix())
+            except OSError as e:
+                return EpisodeResult(name, "failed", None, _partial(e, done))
             report(1.0)
             return EpisodeResult(name, "copied")
         info = probe(tools, ep.video)
@@ -182,10 +204,18 @@ def export_episode(tools: Tools, ep: EpisodeFiles, season_folder: Path, cuts: li
         report(0.85)
 
         _mux(tools, info, video, audio, subs, meta, part, final.suffix.lower(), work)
-        for tmp, dst in sides:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(tmp, dst)
-        os.replace(part, final)
+        # The video first: it is the file most likely to be locked (open in a player).
+        # If a later replace fails, the message names what was already updated.
+        done: list[str] = []
+        try:
+            os.replace(part, final)
+            done.append(final.relative_to(out_dir).as_posix())
+            for tmp, dst in sides:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(tmp, dst)
+                done.append(dst.relative_to(out_dir).as_posix())
+        except OSError as e:
+            return EpisodeResult(name, "failed", mode, _partial(e, done))
         report(1.0)
         return EpisodeResult(name, "trimmed", mode)
     except SmartCutError as e:
