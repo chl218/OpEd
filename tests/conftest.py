@@ -73,18 +73,18 @@ def window_with_project(qtbot, tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolated_qsettings(tmp_path_factory):
-    """Keep QSettings (saved ffmpeg paths) out of the user's real profile."""
+    """Keep QSettings (saved ffmpeg paths) out of the user's real profile.
+
+    The app uses IniFormat/UserScope settings (``main_window._settings``), so pointing
+    that format's user path at a temp dir isolates them. Never touch
+    ``QSettings("oped", "oped")``: that is NativeFormat (the registry on Windows) and
+    ``setPath`` does not redirect it. Yields the temp dir.
+    """
     try:
         from PySide6.QtCore import QSettings
     except ImportError:
-        yield
+        yield None
         return
-    QSettings.setPath(
-        QSettings.Format.IniFormat,
-        QSettings.Scope.UserScope,
-        str(tmp_path_factory.mktemp("qsettings")),
-    )
-    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
-    QSettings("oped", "oped").clear()
-    yield
-    QSettings("oped", "oped").clear()
+    d = tmp_path_factory.mktemp("qsettings")
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(d))
+    yield d

@@ -225,6 +225,16 @@ def summarize(results: list[EpisodeResult], skipped: set[str]) -> str:
     return "\n".join(lines)
 
 
+def _settings() -> QSettings:
+    """The app's settings: an INI file in the per-user config location.
+
+    Always IniFormat. ``QSettings("oped", "oped")`` would be NativeFormat (the registry
+    on Windows, a plist on macOS), which ``QSettings.setPath`` cannot redirect, so tests
+    could not keep it out of the user's real settings.
+    """
+    return QSettings(QSettings.Format.IniFormat, QSettings.Scope.UserScope, "oped", "oped")
+
+
 def _tool_works(path: str) -> bool:
     """True if `path` exists and answers `-version`."""
     try:
@@ -333,7 +343,7 @@ class MainWindow(QMainWindow):
     def _try_find_tools(self, ffmpeg: str | None = None, ffprobe: str | None = None) -> None:
         """Use the given (or stored) paths if they work, else search PATH."""
         if ffmpeg is None and ffprobe is None:
-            s = QSettings("oped", "oped")
+            s = _settings()
             ffmpeg = s.value("ffmpeg_path", None) or None
             ffprobe = s.value("ffprobe_path", None) or None
         if ffmpeg or ffprobe:
@@ -362,7 +372,7 @@ class MainWindow(QMainWindow):
             self._reload_current_episode()
             return
         self._tools_refusal = ""
-        s = QSettings("oped", "oped")
+        s = _settings()
         s.setValue("ffmpeg_path", ffmpeg)
         s.setValue("ffprobe_path", ffprobe)
         s.sync()

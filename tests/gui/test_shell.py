@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 
@@ -150,8 +151,6 @@ def test_pending_edit_flushed_on_folder_switch(qtbot, tmp_path):
 
 
 def test_invalid_tool_paths_not_saved_and_fall_back_to_path(qtbot, monkeypatch, tmp_path):
-    from PySide6.QtCore import QSettings
-
     seen = []
 
     def fake(ffmpeg=None, ffprobe=None):
@@ -163,9 +162,9 @@ def test_invalid_tool_paths_not_saved_and_fall_back_to_path(qtbot, monkeypatch, 
     w = MainWindow()
     qtbot.addWidget(w)
     w.set_tool_paths(str(bogus), str(bogus))
-    assert QSettings("oped", "oped").value("ffmpeg_path") is None
+    assert main_window._settings().value("ffmpeg_path") is None
     assert w.tools == "PATH_TOOLS"
-    s = QSettings("oped", "oped")
+    s = main_window._settings()
     s.setValue("ffmpeg_path", str(bogus))
     s.setValue("ffprobe_path", str(bogus))
     seen.clear()
@@ -188,8 +187,6 @@ def _slow_tool(tmp_path):
 
 
 def test_hanging_tool_is_invalid_not_saved_and_refusal_shown(qtbot, monkeypatch, tmp_path):
-    from PySide6.QtCore import QSettings
-
     monkeypatch.setattr(main_window, "TOOL_CHECK_TIMEOUT", 0.5)
     monkeypatch.setattr(main_window, "find_tools", lambda ffmpeg=None, ffprobe=None: "PATH_TOOLS")
     slow = _slow_tool(tmp_path)
@@ -197,7 +194,7 @@ def test_hanging_tool_is_invalid_not_saved_and_refusal_shown(qtbot, monkeypatch,
     w = MainWindow()
     qtbot.addWidget(w)
     w.set_tool_paths(str(slow), str(slow))
-    assert QSettings("oped", "oped").value("ffmpeg_path") is None
+    assert main_window._settings().value("ffmpeg_path") is None
     assert w.tools == "PATH_TOOLS"
     assert "not accepted" in w.banner.text()
 
@@ -235,3 +232,20 @@ def test_banner_says_where_the_project_is_saved_when_folder_is_readonly(qtbot, t
     w._autosave()
     w._autosave()
     assert w.banner.text().count(str(elsewhere)) == 1
+
+
+def test_settings_are_ini_files_under_the_redirected_test_dir(qtbot, monkeypatch, _isolated_qsettings):
+    """S1: main_window._settings() is always NativeFormat (the registry on Windows), so
+    the app must use an explicit IniFormat object, which the test fixture redirects."""
+    from PySide6.QtCore import QSettings
+
+    s = main_window._settings()
+    assert s.format() == QSettings.Format.IniFormat
+    assert Path(s.fileName()).resolve().is_relative_to(Path(_isolated_qsettings).resolve())
+    monkeypatch.setattr(main_window, "find_tools", lambda ffmpeg=None, ffprobe=None: "TOOLS")
+    monkeypatch.setattr(main_window, "_tool_works", lambda p: True)
+    w = MainWindow()
+    qtbot.addWidget(w)
+    w.set_tool_paths("x/ffmpeg", "x/ffprobe")
+    ini = Path(main_window._settings().fileName())
+    assert ini.exists() and "x/ffmpeg" in ini.read_text(encoding="utf-8")
