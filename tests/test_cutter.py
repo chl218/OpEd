@@ -4,9 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from fixtures import dominant_freq, frame_color, make_color_video
-from oped.cutter import SmartCutError, concat_list, cut_audio, cut_video
-from oped.media import probe
+import numpy as np
+
+from fixtures import RATE, dominant_freq, frame_color, make_color_video
+from oped.cutter import SmartCutError, concat_list, cut_audio, cut_video, snap_to_frames
+from oped.media import probe, run
 
 COLORS = [("red", 10), ("green", 10), ("blue", 10)]   # tones 440 / 880 / 1320
 
@@ -86,3 +88,65 @@ def test_no_stray_temp_files(tools, tmp_path, monkeypatch):
         cut_video(tools, info, [(0, 5.0)], out_dir / "bad.mkv", "smart", work)
     assert sorted(p.name for p in out_dir.iterdir()) == ["a.mka", "v.mkv"]
     assert list(work.iterdir()) == []
+
+
+def _color_switch(tools, path, lo, hi, channel):
+    """Time (to ~0.25 ms) at which ``channel`` first dominates the frame on screen."""
+    for _ in range(12):
+        mid = (lo + hi) / 2
+        if frame_color(tools, path, mid)[channel] > 200:
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
+def _tone_switch(tools, path, lo, hi, f_old, f_new, stream=0):
+    """Time at which tone ``f_new`` overtakes ``f_old`` (4 ms windows, samples placed by pts)."""
+    out = run([
+        tools.ffmpeg, "-v", "error", "-nostdin", "-i", str(path), "-map", f"0:a:{stream}",
+        "-af", f"aresample=async=1:min_hard_comp=0.001:first_pts=0,atrim=start={lo}:end={hi}",
+        "-ac", "1", "-ar", str(RATE), "-f", "s16le", "-",
+    ]).stdout
+    x = np.frombuffer(out, dtype="<i2").astype(np.float64)
+    n = int(0.004 * RATE)
+    tt = np.arange(n) / RATE
+    for i in range(0, len(x) - n, n // 4):
+        seg = x[i:i + n]
+        if abs(seg @ np.exp(-2j * np.pi * f_new * tt)) > abs(seg @ np.exp(-2j * np.pi * f_old * tt)):
+            return lo + (i + n / 2) / RATE
+    raise AssertionError("no tone switch found")
+
+
+def test_snap_to_frames_uses_the_video_frame_grid(tools, tmp_path):
+    src = make_color_video(tools, tmp_path / "g.mkv", COLORS)          # 24 fps, ms timestamps
+    snapped = snap_to_frames(tools, probe(tools, src), [(0, 5.01), (15.03, 30), (29.99, 29.995)])
+    assert snapped == [pytest.approx((0, 5.042), abs=0.001), pytest.approx((15.042, 30.0), abs=0.001)]
+
+
+def test_off_grid_cuts_keep_audio_in_sync_with_video(tools, tmp_path):
+    src = make_color_video(tools, tmp_path / "o.mkv", COLORS, audio_codecs=("aac", "flac"))
+    info = probe(tools, src)
+    keep = [(0, 5.01), (15.03, 30)]                    # neither boundary is on the 24 fps grid
+    v = cut_video(tools, info, keep, tmp_path / "v.mkv", "smart", tmp_path)
+    a = cut_audio(tools, info, keep, tmp_path / "a.mka", tmp_path)
+    # Source green->blue at 20.0 s; it must land at the same output time in video and audio.
+    video_t = _color_switch(tools, v, 9.5, 10.5, channel=2)
+    for stream in (0, 1):
+        audio_t = _tone_switch(tools, a, 9.5, 10.5, 880, 1320, stream)
+        assert abs(audio_t - video_t) < 0.008, (stream, audio_t, video_t)
+
+
+@pytest.mark.parametrize("vcodec", [
+    "libx264",
+    pytest.param("libx265", marks=pytest.mark.skipif(
+        not _has_encoder("libx265"), reason="ffmpeg lacks libx265")),
+])
+@pytest.mark.parametrize("ext", ["mkv", "mp4"])
+def test_smart_cut_source_without_bframes(tools, tmp_path, vcodec, ext):
+    src = make_color_video(tools, tmp_path / f"nb.{ext}", COLORS, fps="24000/1001", vcodec=vcodec,
+                           vopts=("-bf", "0"))
+    v = cut_video(tools, probe(tools, src), [(0, 5), (15, 30)], tmp_path / "v.mkv", "smart", tmp_path)
+    assert abs(probe(tools, v).duration - 20) < 0.1
+    assert frame_color(tools, v, 4.9)[0] > 200
+    assert frame_color(tools, v, 5.06)[1] > 100

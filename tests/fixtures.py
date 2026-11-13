@@ -122,9 +122,10 @@ def make_color_video(
     path: Path,
     colors: list[tuple[str, float]],
     *,
-    fps: int = 24,
+    fps: int | str = 24,
     gop: int = 48,
     vcodec: str = "libx264",
+    vopts: tuple[str, ...] = (),
     audio_codecs: tuple[str, ...] = ("aac",),
     ass_lines: list[tuple[float, float, str]] | None = None,
     image_sub: bool = False,
@@ -178,7 +179,7 @@ def make_color_video(
             cmd += ["-attach", str(font), "-metadata:s:t", "mimetype=font/ttf"]
 
         cmd += maps
-        cmd += ["-c:v", vcodec, "-pix_fmt", "yuv420p", "-g", str(gop),
+        cmd += ["-c:v", vcodec, *vopts, "-pix_fmt", "yuv420p", "-g", str(gop),
                 "-keyint_min", str(gop), "-sc_threshold", "0"]
         for k, ac in enumerate(audio_codecs):
             cmd += [f"-c:a:{k}", ac]
@@ -202,7 +203,9 @@ def frame_color(tools: Tools, path: Path, t: float) -> tuple[int, int, int]:
     t0 = max(0.0, t - 1.0)
     out = run([
         tools.ffmpeg, "-v", "error", "-nostdin", "-ss", f"{t0:.6f}", "-i", str(path),
-        "-t", f"{t - t0 + 0.0005:.6f}", "-vf", "scale=1:1:flags=area", "-pix_fmt", "rgb24",
+        # Timestamps are relative to t0 here; an output -t would instead count from the
+        # first decoded frame and so overshoot by up to one frame.
+        "-vf", f"select=lte(t\\,{t - t0 + 0.0005:.6f}),scale=1:1:flags=area", "-pix_fmt", "rgb24",
         "-fps_mode", "passthrough", "-f", "rawvideo", "-",
     ]).stdout
     r, g, b = out[-3:]

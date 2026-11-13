@@ -7,6 +7,7 @@ on success and on error; the final file is written there first and moved to ``ou
 from __future__ import annotations
 
 import bisect
+import functools
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -73,7 +74,14 @@ class _Packet:
 
 
 def _video_packets(tools: Tools, path: Path) -> list[_Packet]:
-    """First video stream's packets in decode order."""
+    """First video stream's packets in decode order (cached per file version)."""
+    path = Path(path)
+    st = path.stat()
+    return list(_video_packets_cached(tools, str(path), st.st_mtime_ns, st.st_size))
+
+
+@functools.lru_cache(maxsize=8)
+def _video_packets_cached(tools: Tools, path: str, _mtime: int, _size: int) -> tuple[_Packet, ...]:
     out = run([
         tools.ffprobe, "-v", "error", "-select_streams", "v:0",
         "-show_entries", "packet=pts_time,dts_time,flags", "-of", "csv=p=0", str(path),
@@ -92,7 +100,7 @@ def _video_packets(tools: Tools, path: Path) -> list[_Packet]:
         except ValueError:
             dts = pts
         pkts.append(_Packet(pts, dts, "K" in parts[2]))
-    return pkts
+    return tuple(pkts)
 
 
 def _stream_field(tools: Tools, path: Path, field: str, select: str = "v:0") -> str:
@@ -186,9 +194,11 @@ def _frame_end(pts_sorted: list[float], last: float, fps: float | None) -> float
     i = bisect.bisect_right(pts_sorted, last + _EPS)
     if i < len(pts_sorted):
         return pts_sorted[i]
+    if fps:
+        return last + 1.0 / fps
     if len(pts_sorted) >= 2:
         return last + (pts_sorted[-1] - pts_sorted[-2])
-    return last + (1.0 / fps if fps else 0.04)
+    return last + 0.04
 
 
 def _plan_interval(pkts: list[_Packet], pts_sorted: list[float], a: float, b: float,
@@ -225,7 +235,17 @@ def _plan_interval(pkts: list[_Packet], pts_sorted: list[float], a: float, b: fl
 
 def _smart(tools: Tools, info: MediaInfo, keep: list[Interval], work: Path, out: Path) -> None:
     v = _first_video(info)
-    encoder = SMART_ENCODERS[v.codec]
+    codec, args = SMART_ENCODERS[v.codec]
+    # The joined stream inherits the reorder delay (has_b_frames) of its first piece.
+    # Encoded pieces must not reorder deeper than the source, or dts goes
+    # non-monotonic wherever a copied piece comes first.
+    try:
+        reorder = int(_stream_field(tools, info.path, "has_b_frames"))
+    except ValueError:
+        reorder = 0
+    if reorder < 2:
+        args = [*args, "-bf", str(reorder)]
+    encoder = (codec, args)
     pix_fmt = _stream_field(tools, info.path, "pix_fmt")
     pkts = _video_packets(tools, info.path)
     pts_sorted = sorted(p.pts for p in pkts)
@@ -243,6 +263,27 @@ def _smart(tools: Tools, info: MediaInfo, keep: list[Interval], work: Path, out:
     if not entries:
         raise SmartCutError("nothing to keep")
     _join(tools, entries, work, out, ["-map", "0:v:0"])
+
+
+def snap_to_frames(tools: Tools, info: MediaInfo, keep: list[Interval]) -> list[Interval]:
+    """Snap KEEP intervals to the first video stream's frame grid.
+
+    Each ``(a, b)`` becomes ``(first frame pts >= a, display end of the last frame with
+    pts < b)``, which is exactly what the video cut keeps. Audio, subtitles and chapters
+    must be cut/retimed with these same intervals so they stay in sync with the video.
+    Intervals containing no frame are dropped. Without a video stream ``keep`` is
+    returned unchanged (minus empty intervals).
+    """
+    if info.video() is None:
+        return [(float(a), float(b)) for a, b in keep if b > a]
+    pts_sorted = sorted(p.pts for p in _video_packets(tools, info.path))
+    snapped: list[Interval] = []
+    for a, b in keep:
+        lo = bisect.bisect_left(pts_sorted, a - _EPS)
+        hi = bisect.bisect_left(pts_sorted, b - _EPS)
+        if hi > lo:
+            snapped.append((pts_sorted[lo], _frame_end(pts_sorted, pts_sorted[hi - 1], info.fps)))
+    return snapped
 
 
 def _validate(tools: Tools, path: Path, expected: float) -> None:
@@ -309,6 +350,14 @@ def cut_video(tools: Tools, info: MediaInfo, keep: list[Interval], out: Path, mo
             raise SmartCutError(f"smart cut does not support {v.codec or 'unknown'} video")
     elif mode not in ("reencode", "keyframe"):
         raise ValueError(f"unknown mode {mode!r}")
+    try:
+        keep = snap_to_frames(tools, info, keep)
+    except FfmpegError as e:
+        if mode == "smart":
+            raise SmartCutError(str(e)) from e
+        raise
+    if not keep:
+        raise SmartCutError("nothing to keep") if mode == "smart" else ValueError("nothing to keep")
     expected = sum(b - a for a, b in keep)
     try:
         Path(workdir).mkdir(parents=True, exist_ok=True)
@@ -340,8 +389,12 @@ def cut_audio(tools: Tools, info: MediaInfo, keep: list[Interval], out: Path, wo
     The concat demuxer seeks on the video stream, so ``inpoint`` on the source would
     start audio at the previous video keyframe. Each interval is therefore first
     extracted audio-only (output-side ``-ss``/``-to`` drops packets outside it), and the
-    pieces are joined with the concat demuxer.
+    pieces are joined with the concat demuxer. Intervals are first snapped to the video
+    frame grid (``snap_to_frames``) so audio and video cut at the same instants.
     """
+    keep = snap_to_frames(tools, info, keep)
+    if not keep:
+        raise ValueError("nothing to keep")
     Path(workdir).mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="oped_cut_", dir=workdir))
     try:
