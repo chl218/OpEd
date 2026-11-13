@@ -185,8 +185,9 @@ def _diagonal_run(a: np.ndarray, bs: list[np.ndarray]) -> tuple[int, int, int] |
     valid = (j >= 0) & (j < m)
     diag = mask[np.broadcast_to(i, j.shape), np.clip(j, 0, m - 1)] & valid
     # Close gaps of up to DISC_GAP cells: a cell is filled when a True lies within
-    # DISC_GAP + 1 cells on both sides along the diagonal.
-    g = DISC_GAP + 1
+    # DISC_GAP cells on both sides along the diagonal. (Cell k of an L-cell gap is k and
+    # L + 1 - k cells from the Trues around it, so every cell qualifies iff L <= DISC_GAP.)
+    g = DISC_GAP
     pad = np.pad(diag, ((0, 0), (g, g)))
     left = np.zeros_like(diag)
     right = np.zeros_like(diag)

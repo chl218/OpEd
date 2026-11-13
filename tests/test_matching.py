@@ -221,3 +221,26 @@ def test_discovery_is_fast():
     t0 = time.perf_counter()
     discover_references(ep)
     assert time.perf_counter() - t0 < 10
+
+
+def _diag_with_gap(gap, n=40):
+    """a and b identical except ``gap`` blocks (rows 10..) of b are orthogonal to a."""
+    rng = np.random.default_rng(0)
+    a = rng.standard_normal((n, 12))
+    a /= np.linalg.norm(a, axis=1, keepdims=True)
+    b = a.copy()
+    for r in range(10, 10 + gap):
+        v = rng.standard_normal(12)
+        v -= (v @ a[r]) * a[r]        # orthogonal to a[r]: similarity 0 on the diagonal
+        b[r] = v / np.linalg.norm(v)
+    return a, b
+
+
+# A gap of 3 splits the 40-block diagonal into 10 | gap | 27.
+@pytest.mark.parametrize("gap,expected", [(1, 40), (2, 40), (3, 27)])
+def test_diagonal_run_closes_gaps_of_at_most_disc_gap(gap, expected):
+    from oped.matching import DISC_GAP, _diagonal_run
+    assert DISC_GAP == 2
+    a, b = _diag_with_gap(gap)
+    i, j, length = _diagonal_run(a, [b])
+    assert length == expected and i == j
